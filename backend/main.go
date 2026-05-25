@@ -1067,8 +1067,8 @@ func runRealDownload(w http.ResponseWriter, flusher http.Flusher, pageURL, platf
 		return
 	}
 
-	// Try OG video fallback as secondary method
-	if runOgVideoFallback(w, flusher, pageURL, platform) {
+	// Try OG video fallback as secondary method (skip YouTube — never returns direct video URLs, only hangs)
+	if platform != "YouTube" && runOgVideoFallback(w, flusher, pageURL, platform) {
 		return
 	}
 

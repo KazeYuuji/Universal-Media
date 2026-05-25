@@ -287,9 +287,9 @@ func buildYouTubeOptionsFromInfo(info ytDlpInfo, videoID string) (title string, 
 
 func fetchYouTubeViaKkdai(pageURL, videoID string) (title string, duration string, thumbnail string, options []MediaOption) {
 	client := yt.Client{
-		HTTPClient: &http.Client{Timeout: 30 * time.Second},
+		HTTPClient: &http.Client{Timeout: 10 * time.Second},
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	video, err := client.GetVideoContext(ctx, pageURL)
