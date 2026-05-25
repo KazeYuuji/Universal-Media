@@ -93,6 +93,28 @@ type sortFormat struct {
 	hasAudio bool
 }
 
+func runYtDlp(pageURL string, extraArgs ...string) (ytDlpInfo, bool) {
+	var stdout bytes.Buffer
+	args := []string{
+		"-J", "--no-download",
+		"--js-runtimes", "node",
+		"--remote-components", "ejs:github",
+	}
+	args = append(args, extraArgs...)
+	args = append(args, pageURL)
+	cmd := exec.Command(findYtDlp(), args...)
+	cmd.Stdout = &stdout
+	cmd.Stderr = nil
+	if cmd.Run() != nil {
+		return ytDlpInfo{}, false
+	}
+	var info ytDlpInfo
+	if json.Unmarshal(stdout.Bytes(), &info) != nil {
+		return ytDlpInfo{}, false
+	}
+	return info, len(info.Formats) > 0
+}
+
 func fetchYouTubeVideos(pageURL, platform string) (title string, duration string, thumbnail string, options []MediaOption) {
 	videoID := extractYouTubeVideoID(pageURL)
 	if videoID == "" {
@@ -107,34 +129,40 @@ func fetchYouTubeVideos(pageURL, platform string) (title string, duration string
 		return fetchYouTubeViaKkdai(pageURL, videoID)
 	}
 
-	var stdout bytes.Buffer
-	ytArgs := []string{
-		"-J", "--no-download",
-		"--js-runtimes", "node",
-		"--remote-components", "ejs:github",
-		pageURL,
+	// Try multiple yt-dlp client configs — Android client often bypasses login requirement
+	clientAttempts := []struct {
+		label string
+		args  []string
+	}{
+		{"android", []string{"--extractor-args", "youtube:player_client=android"}},
+		{"android_vr", []string{"--extractor-args", "youtube:player_client=android_vr"}},
+		{"web", []string{"--extractor-args", "youtube:player_client=web"}},
+		{"default", nil},
 	}
-	cmd := exec.Command(ytDlpPath, ytArgs...)
-	cmd.Stdout = &stdout
-	cmd.Stderr = nil
-	if err := cmd.Run(); err != nil {
-		log.Printf("[YouTube] yt-dlp failed: %v, trying kkdai\n", err)
-		return fetchYouTubeViaKkdai(pageURL, videoID)
+	for _, attempt := range clientAttempts {
+		log.Printf("[YouTube] trying yt-dlp with %s client\n", attempt.label)
+		var info ytDlpInfo
+		var ok bool
+		if attempt.args != nil {
+			info, ok = runYtDlp(pageURL, attempt.args...)
+		} else {
+			info, ok = runYtDlp(pageURL)
+		}
+		if !ok {
+			continue
+		}
+		title, duration, thumbnail, options = buildYouTubeOptionsFromInfo(info, videoID)
+		if len(options) > 0 {
+			log.Printf("[YouTube] yt-dlp %s client succeeded: %d options\n", attempt.label, len(options))
+			return title, duration, thumbnail, options
+		}
 	}
 
-	var info ytDlpInfo
-	if err := json.Unmarshal(stdout.Bytes(), &info); err != nil {
-		log.Printf("[YouTube] yt-dlp JSON parse error: %v\n", err)
-		return fetchYouTubeViaKkdai(pageURL, videoID)
+	log.Printf("[YouTube] all yt-dlp clients failed, trying kkdai\n")
+	if t, d, th, opts := fetchYouTubeViaKkdai(pageURL, videoID); len(opts) > 0 {
+		return t, d, th, opts
 	}
-
-	title, duration, thumbnail, options = buildYouTubeOptionsFromInfo(info, videoID)
-	if len(options) > 0 {
-		return title, duration, thumbnail, options
-	}
-	// All real extraction methods failed (YT blocks unauthenticated requests).
-	// Don't return thumbnail-only options in video mode — let runRealDownload
-	// fall through to simulation so users see actionable download options.
+	// All real extraction methods failed.
 	return "", "", "", nil
 }
 
