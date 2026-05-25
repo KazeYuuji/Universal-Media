@@ -48,13 +48,14 @@ export default function MediaCard({
         aria-label={`Lihat preview ${option.quality}`}
       >
         <img
-          src={isImage ? proxyUrl(option.url, true) : (thumbnail ? proxyUrl(thumbnail, true) : "")}
+          src={isImage ? option.url : (thumbnail ? proxyUrl(thumbnail, true) : "")}
           alt={option.quality}
           className="w-full h-full object-cover"
           loading="lazy"
           onError={(e) => {
             const img = e.currentTarget as HTMLImageElement;
-            if (thumbnail) img.src = proxyUrl(thumbnail, true);
+            if (isImage && thumbnail) img.src = thumbnail;
+            else if (thumbnail) img.src = proxyUrl(thumbnail, true);
           }}
         />
         <span className="absolute top-2 left-2 bg-black/60 text-white text-[10px] font-bold px-2 py-0.5 rounded-md">

@@ -184,13 +184,15 @@ export default function Home() {
           setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
         }, 800);
       } else {
+        // Proxy failed — try direct download from source URL
         setIsDownloading(false);
+        window.open(option.url, "_blank", "noopener");
       }
     };
 
     xhr.onerror = () => {
       setIsDownloading(false);
-      window.open(dlUrl, "_blank", "noopener");
+      window.open(option.url, "_blank", "noopener");
     };
 
     xhr.send();
