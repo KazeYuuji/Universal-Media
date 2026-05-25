@@ -26,7 +26,7 @@ export default function MediaCard({
   const isImage = isImageFormat(option.format) || mediaType === "image";
 
   const getThumbnailUrl = () => {
-    if (isImage) return proxyUrl(option.url, true);
+    if (isImage) return option.url;
     const params = new URLSearchParams({ url: thumbnail || option.url, preview: "1" });
     return `/api/proxy?${params.toString()}`;
   };
