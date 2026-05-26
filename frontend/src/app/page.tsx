@@ -104,6 +104,21 @@ export default function Home() {
     return `${m}m ${s}d`;
   };
 
+  const triggerDirectDownload = (option: MediaOption, filename: string) => {
+    const a = document.createElement("a");
+    a.href = option.directUrl!;
+    a.download = `${filename}.${option.format || "bin"}`;
+    a.target = "_blank";
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setIsDownloading(false);
+    setProgress(100);
+    setDownloadStatus("Mengunduh langsung dari CDN...");
+    setTimeout(() => setDownloadStatus("Selesai"), 2000);
+  };
+
   const triggerDownload = (option: MediaOption) => {
     setIsDownloading(true);
     setDownloadProgress(0);
@@ -116,6 +131,12 @@ export default function Home() {
     const qualityLabel = option.quality.replace(/\s*\(.*?\)\s*/g, '').trim();
     const filename = `${safeTitle} - ${qualityLabel}`;
     const totalBytes = parseSize(option.size);
+
+    // Direct CDN URL from Vercel API — skip proxy, download straight from browser
+    if (option.directUrl) {
+      triggerDirectDownload(option, filename);
+      return;
+    }
 
     setDownloadStatus(`Mengunduh ${qualityLabel}...`);
 
@@ -198,18 +219,22 @@ export default function Home() {
     xhr.send();
   };
 
-  const handleDownload = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!url) return;
+  const ytVideoId = (targetUrl: string): string | null => {
+    const patterns = [
+      /(?:youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/,
+      /youtube\.com\/embed\/([a-zA-Z0-9_-]{11})/,
+      /youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})/,
+    ];
+    for (const p of patterns) {
+      const m = targetUrl.match(p);
+      if (m) return m[1];
+    }
+    return null;
+  };
 
-    setIsProcessing(true);
-    setProgress(0);
-    setStatus(downloadMode === "image" ? "Menganalisis link foto..." : "Menganalisis link video...");
-    setMetadata(null);
-    setError("");
-
+  const startSse = (targetUrl: string) => {
     const streamPath = downloadMode === "image" ? "image" : "video";
-    const evtSource = new EventSource(`${BACKEND}/api/stream/${streamPath}?url=${encodeURIComponent(url)}`);
+    const evtSource = new EventSource(`${BACKEND}/api/stream/${streamPath}?url=${encodeURIComponent(targetUrl)}`);
 
     evtSource.onmessage = (event) => {
       const data = JSON.parse(event.data);
@@ -237,8 +262,8 @@ export default function Home() {
 
         const newItem: HistoryItem = {
           id: Math.random().toString(36).substring(2, 9),
-          url: url,
-          platform: getPlatformFromUrl(url),
+          url: targetUrl,
+          platform: getPlatformFromUrl(targetUrl),
           title: data.title,
           thumbnail: data.thumbnail,
           timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
@@ -254,6 +279,60 @@ export default function Home() {
       setIsProcessing(false);
       evtSource.close();
     };
+  };
+
+  const handleDownload = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!url) return;
+
+    setIsProcessing(true);
+    setProgress(0);
+    setStatus(downloadMode === "image" ? "Menganalisis link foto..." : "Menganalisis link video...");
+    setMetadata(null);
+    setError("");
+
+    const vid = ytVideoId(url);
+    if (vid) {
+      setStatus("Mengekstrak dari Vercel API...");
+      fetch(`/api/yt-extract?id=${vid}`)
+        .then((r) => {
+          if (!r.ok) throw new Error("Vercel API gagal");
+          return r.json();
+        })
+        .then((data) => {
+          if (data.error || !data.options?.length) throw new Error(data.error || "Tidak ada format");
+          const meta: MediaMetadata = {
+            mediaType: "video",
+            title: data.title,
+            duration: data.duration || "0:00",
+            thumbnail: data.thumbnail,
+            options: data.options.map((o: any) => ({
+              quality: o.quality,
+              format: o.format,
+              size: o.size,
+              url: o.url,
+              directUrl: o.directUrl || o.url,
+              ytFormat: "direct",
+            })),
+          };
+          setMetadata(meta);
+          setIsProcessing(false);
+          const newItem: HistoryItem = {
+            id: Math.random().toString(36).substring(2, 9),
+            url, platform: "YouTube", title: data.title, thumbnail: data.thumbnail,
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+          };
+          const updatedHistory = [newItem, ...history.slice(0, 4)];
+          setHistory(updatedHistory);
+          localStorage.setItem("download_history", JSON.stringify(updatedHistory));
+        })
+        .catch(() => {
+          setStatus("Vercel API gagal, fallback ke backend...");
+          startSse(url);
+        });
+    } else {
+      startSse(url);
+    }
   };
 
   const clearHistory = () => { setHistory([]); localStorage.removeItem("download_history"); };

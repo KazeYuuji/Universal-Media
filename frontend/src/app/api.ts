@@ -5,6 +5,7 @@ export interface MediaOption {
   url: string;
   audioUrl?: string;
   ytFormat?: string;
+  directUrl?: string;
 }
 
 export interface MediaMetadata {
