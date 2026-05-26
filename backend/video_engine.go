@@ -204,10 +204,10 @@ func fetchYouTubeVideos(pageURL, platform string) (title string, duration string
 		label string
 		args  []string
 	}{
-		{"tv", []string{"--extractor-args", "youtube:player_client=tv,youtube:include_dash_manifest=False", "--retries", "3", "--extractor-retries", "3", "--js-runtimes", "deno", "--force-ipv4"}},
-		{"android+skip", []string{"--extractor-args", "youtube:player_client=android,youtube:skip=webpage", "--retries", "3", "--extractor-retries", "3", "--js-runtimes", "deno", "--force-ipv4"}},
-		{"web", []string{"--extractor-args", "youtube:player_client=web", "--retries", "3", "--extractor-retries", "3", "--js-runtimes", "deno", "--force-ipv4"}},
-		{"default", []string{"--retries", "3", "--extractor-retries", "3", "--js-runtimes", "deno", "--force-ipv4"}},
+		{"tv", []string{"--extractor-args", "youtube:player_client=tv,youtube:include_dash_manifest=False", "--retries", "3", "--extractor-retries", "3", "--force-ipv4"}},
+		{"android+skip", []string{"--extractor-args", "youtube:player_client=android,youtube:skip=webpage", "--retries", "3", "--extractor-retries", "3", "--force-ipv4"}},
+		{"web", []string{"--extractor-args", "youtube:player_client=web", "--retries", "3", "--extractor-retries", "3", "--force-ipv4"}},
+		{"default", []string{"--retries", "3", "--extractor-retries", "3", "--force-ipv4"}},
 	}
 	for _, attempt := range clientAttempts {
 		log.Printf("[YouTube] trying yt-dlp with %s client\n", attempt.label)
@@ -629,7 +629,6 @@ func fetchYouTubeViaDirectPipe(pageURL, videoID string) (title string, duration 
 		"-g", "-f", "best[ext=mp4]",
 		"--no-download",
 		"--retries", "3",
-		"--js-runtimes", "deno",
 		"--force-ipv4",
 	}
 	args = append(args, cookieArgs()...)
@@ -710,46 +709,56 @@ type rawAPIPlayerResponse struct {
 func fetchYouTubeViaRawAPI(videoID string) (title string, duration string, thumbnail string, options []MediaOption) {
 	client := &http.Client{Timeout: 15 * time.Second}
 
-	// Strategy 1: Direct InnerTube API call with android client
-	innerTubePayload := fmt.Sprintf(`{
-		"videoId": "%s",
-		"context": {
-			"client": {
-				"clientName": "ANDROID",
-				"clientVersion": "19.09.37",
-				"androidSdkVersion": 30,
-				"hl": "en",
-				"gl": "US"
+	// Strategy 1: Extract InnerTube API key from YouTube page, then call API
+	innerTubeKey := extractInnerTubeAPIKey(client)
+	if innerTubeKey == "" {
+		innerTubeKey = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
+	}
+	clientVersions := []string{"19.09.37", "2.20240101.00.00", "17.31.35"}
+	clientNames := []string{"ANDROID", "WEB", "ANDROID"}
+	for i := range clientVersions {
+		cn := clientNames[i]
+		cv := clientVersions[i]
+		payload := fmt.Sprintf(`{
+			"videoId": "%s",
+			"context": {
+				"client": {
+					"clientName": "%s",
+					"clientVersion": "%s",
+					"hl": "en",
+					"gl": "US"
+				}
 			}
-		},
-		"contentCheckOk": true,
-		"racyCheckOk": true
-	}`, videoID)
-
-	for _, key := range []string{"AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8", "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w", "AIzaSyC9pdB7I7C0NSSF8_hGsWDkB0fVLEAQMl0"} {
-		req, err := http.NewRequest("POST", fmt.Sprintf("https://www.youtube.com/youtubei/v1/player?key=%s", key),
-			strings.NewReader(innerTubePayload))
+		}`, videoID, cn, cv)
+		req, err := http.NewRequest("POST",
+			fmt.Sprintf("https://www.youtube.com/youtubei/v1/player?key=%s", innerTubeKey),
+			strings.NewReader(payload))
 		if err != nil {
 			continue
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip")
-		req.Header.Set("X-YouTube-Client-Name", "3")
-		req.Header.Set("X-YouTube-Client-Version", "19.09.37")
+		if cn == "ANDROID" {
+			req.Header.Set("User-Agent", "com.google.android.youtube/"+cv+" (Linux; U; Android 11) gzip")
+			req.Header.Set("X-YouTube-Client-Name", "3")
+		} else {
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+			req.Header.Set("X-YouTube-Client-Name", "1")
+		}
+		req.Header.Set("X-YouTube-Client-Version", cv)
 		resp, err := client.Do(req)
 		if err != nil {
 			continue
 		}
-		body, err := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if err != nil || resp.StatusCode != 200 {
+		if resp.StatusCode != 200 {
 			continue
 		}
 		var pr rawAPIPlayerResponse
 		if json.Unmarshal(body, &pr) != nil {
 			continue
 		}
-		if pr.StreamingData.ExpiresInSecs == "" {
+		if len(pr.StreamingData.Formats) == 0 && len(pr.StreamingData.AdaptiveFormats) == 0 {
 			continue
 		}
 		if pr.VideoDetails != nil {
@@ -773,9 +782,8 @@ func fetchYouTubeViaRawAPI(videoID string) (title string, duration string, thumb
 				continue
 			}
 			seen[f.URL] = true
-			label := fmt.Sprintf("Video %s", f.Quality)
 			options = append(options, MediaOption{
-				Quality: label,
+				Quality: fmt.Sprintf("Video %s", f.Quality),
 				Format:  "mp4",
 				Size:    "Dinamis",
 				URL:     f.URL,
@@ -808,7 +816,7 @@ func fetchYouTubeViaRawAPI(videoID string) (title string, duration string, thumb
 			}
 		}
 		if len(options) > 0 {
-			log.Printf("[YouTube RawAPI] InnerTube key %s success: %d options\n", key[:20], len(options))
+			log.Printf("[YouTube RawAPI] %s v%s success: %d options\n", cn, cv, len(options))
 			return title, duration, thumbnail, options
 		}
 	}
@@ -852,6 +860,30 @@ func fetchYouTubeViaRawAPI(videoID string) (title string, duration string, thumb
 
 	log.Printf("[YouTube RawAPI] all strategies failed\n")
 	return "", "", "", nil
+}
+
+func extractInnerTubeAPIKey(client *http.Client) string {
+	req, _ := http.NewRequest("GET", "https://www.youtube.com", nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	html := string(body)
+	// Try ytcfg key first
+	m := regexp.MustCompile(`"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"`).FindStringSubmatch(html)
+	if len(m) > 1 {
+		log.Printf("[YouTube] Extracted InnerTube API key from page\n")
+		return m[1]
+	}
+	// Try ytInitialPlayerResponse
+	m = regexp.MustCompile(`"innertubeApiKey"\s*:\s*"([^"]+)"`).FindStringSubmatch(html)
+	if len(m) > 1 {
+		return m[1]
+	}
+	return ""
 }
 
 func extractTitleFromHTML(html string) string {
@@ -1571,13 +1603,16 @@ func generateYouTubeCookies() string {
 	tmpFile := filepath.Join(os.TempDir(), "yt-cookies-"+strconv.FormatInt(time.Now().UnixNano(), 36)+".txt")
 	var lines []string
 	lines = append(lines, "# Netscape HTTP Cookie File")
-	lines = append(lines, ".youtube.com	TRUE	/	TRUE	1735689600	VISITOR_INFO1_LIVE	eMj-Z8IOjns")
 	for _, c := range resp.Cookies() {
 		exp := c.Expires.Unix()
 		if exp <= 0 {
-			exp = 1735689600
+			exp = time.Now().Add(24 * time.Hour).Unix()
 		}
-		lines = append(lines, fmt.Sprintf(".youtube.com	TRUE	/	TRUE	%d	%s	%s", exp, c.Name, c.Value))
+		secure := "FALSE"
+		if c.Secure {
+			secure = "TRUE"
+		}
+		lines = append(lines, fmt.Sprintf("%s	TRUE	%s	%s	%d	%s	%s", c.Domain, c.Path, secure, exp, c.Name, c.Value))
 	}
 	if err := os.WriteFile(tmpFile, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
 		return ""
