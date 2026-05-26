@@ -239,7 +239,12 @@ func fetchYouTubeVideos(pageURL, platform string) (title string, duration string
 		return bestResult.title, bestResult.dur, bestResult.thumb, bestResult.options
 	}
 
-	log.Printf("[YouTube] all yt-dlp clients failed, trying kkdai\n")
+	log.Printf("[YouTube] all yt-dlp clients failed, trying Raw API\n")
+	if t, d, th, opts := fetchYouTubeViaRawAPI(videoID); len(opts) > 0 {
+		return t, d, th, opts
+	}
+
+	log.Printf("[YouTube] Raw API failed, trying kkdai\n")
 	if t, d, th, opts := fetchYouTubeViaKkdai(pageURL, videoID); len(opts) > 0 {
 		return t, d, th, opts
 	}
@@ -665,7 +670,203 @@ func fetchYouTubeViaDirectPipe(pageURL, videoID string) (title string, duration 
 	return title, duration, thumbnail, options
 }
 
-// ─── Method 6: Piped API ───────────────────────────────────────────────────────
+// ─── Method 6: Raw API calls (bypass yt-dlp for HF Spaces) ─────────────────────
+
+var (
+	ytPlayerPattern = regexp.MustCompile(`ytInitialPlayerResponse\s*=\s*({.+?});`)
+)
+
+type rawAPIFormat struct {
+	ITag      int    `json:"itag"`
+	URL       string `json:"url"`
+	MimeType  string `json:"mimeType"`
+	Quality   string `json:"quality"`
+	ContentLen string `json:"contentLength"`
+	Bitrate   int    `json:"bitrate"`
+	Width     int    `json:"width"`
+	Height    int    `json:"height"`
+	FPS       int    `json:"fps"`
+}
+
+type rawAPIStreamingData struct {
+	Formats         []rawAPIFormat `json:"formats"`
+	AdaptiveFormats []rawAPIFormat `json:"adaptiveFormats"`
+	ExpiresInSecs   string         `json:"expiresInSeconds"`
+}
+
+type rawAPIPlayerResponse struct {
+	StreamingData rawAPIStreamingData `json:"streamingData"`
+	VideoDetails  *struct {
+		Title      string `json:"title"`
+		Length     string `json:"lengthSeconds"`
+		Thumbnail  struct {
+			Thumbnails []struct {
+				URL string `json:"url"`
+			} `json:"thumbnails"`
+		} `json:"thumbnail"`
+	} `json:"videoDetails"`
+}
+
+func fetchYouTubeViaRawAPI(videoID string) (title string, duration string, thumbnail string, options []MediaOption) {
+	client := &http.Client{Timeout: 15 * time.Second}
+
+	// Strategy 1: Direct InnerTube API call with android client
+	innerTubePayload := fmt.Sprintf(`{
+		"videoId": "%s",
+		"context": {
+			"client": {
+				"clientName": "ANDROID",
+				"clientVersion": "19.09.37",
+				"androidSdkVersion": 30,
+				"hl": "en",
+				"gl": "US"
+			}
+		},
+		"contentCheckOk": true,
+		"racyCheckOk": true
+	}`, videoID)
+
+	for _, key := range []string{"AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8", "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w", "AIzaSyC9pdB7I7C0NSSF8_hGsWDkB0fVLEAQMl0"} {
+		req, err := http.NewRequest("POST", fmt.Sprintf("https://www.youtube.com/youtubei/v1/player?key=%s", key),
+			strings.NewReader(innerTubePayload))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip")
+		req.Header.Set("X-YouTube-Client-Name", "3")
+		req.Header.Set("X-YouTube-Client-Version", "19.09.37")
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil || resp.StatusCode != 200 {
+			continue
+		}
+		var pr rawAPIPlayerResponse
+		if json.Unmarshal(body, &pr) != nil {
+			continue
+		}
+		if pr.StreamingData.ExpiresInSecs == "" {
+			continue
+		}
+		if pr.VideoDetails != nil {
+			title = pr.VideoDetails.Title
+			if len(pr.VideoDetails.Thumbnail.Thumbnails) > 0 {
+				thumbnail = pr.VideoDetails.Thumbnail.Thumbnails[len(pr.VideoDetails.Thumbnail.Thumbnails)-1].URL
+			}
+			if secs, _ := strconv.Atoi(pr.VideoDetails.Length); secs > 0 {
+				duration = fmt.Sprintf("%d:%02d", secs/60, secs%60)
+			}
+		}
+		if title == "" {
+			title = "YouTube Video"
+		}
+		if thumbnail == "" {
+			thumbnail = fmt.Sprintf("https://img.youtube.com/vi/%s/maxresdefault.jpg", videoID)
+		}
+		seen := make(map[string]bool)
+		for _, f := range pr.StreamingData.Formats {
+			if f.URL == "" || seen[f.URL] {
+				continue
+			}
+			seen[f.URL] = true
+			label := fmt.Sprintf("Video %s", f.Quality)
+			options = append(options, MediaOption{
+				Quality: label,
+				Format:  "mp4",
+				Size:    "Dinamis",
+				URL:     f.URL,
+			})
+		}
+		for _, f := range pr.StreamingData.AdaptiveFormats {
+			if f.URL == "" || seen[f.URL] {
+				continue
+			}
+			seen[f.URL] = true
+			isAudio := strings.Contains(f.MimeType, "audio")
+			if isAudio {
+				options = append(options, MediaOption{
+					Quality: "Audio Only",
+					Format:  "m4a",
+					Size:    "Dinamis",
+					URL:     f.URL,
+				})
+			} else {
+				label := fmt.Sprintf("Video %s", f.Quality)
+				if f.Height > 0 {
+					label = fmt.Sprintf("Video %dp", f.Height)
+				}
+				options = append(options, MediaOption{
+					Quality: label,
+					Format:  "mp4",
+					Size:    "Dinamis",
+					URL:     f.URL,
+				})
+			}
+		}
+		if len(options) > 0 {
+			log.Printf("[YouTube RawAPI] InnerTube key %s success: %d options\n", key[:20], len(options))
+			return title, duration, thumbnail, options
+		}
+	}
+
+	// Strategy 2: Fetch m.youtube.com (mobile site, different bot detection)
+	req, err := http.NewRequest("GET", fmt.Sprintf("https://m.youtube.com/watch?v=%s&gl=US&hl=en", videoID), nil)
+	if err == nil {
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.113 Mobile Safari/537.36")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		req.Header.Set("Cookie", "CONSENT=YES+; VISITOR_INFO1_LIVE=; YSC=")
+		resp, err2 := client.Do(req)
+		if err2 == nil && resp.StatusCode == 200 {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			html := string(body)
+			if m := ytPlayerPattern.FindStringSubmatch(html); len(m) > 1 {
+				var pr rawAPIPlayerResponse
+				if json.Unmarshal([]byte(m[1]), &pr) == nil && len(pr.StreamingData.Formats) > 0 {
+					title = extractTitleFromHTML(html)
+					thumbnail = fmt.Sprintf("https://img.youtube.com/vi/%s/maxresdefault.jpg", videoID)
+					for _, f := range pr.StreamingData.Formats {
+						if f.URL == "" {
+							continue
+						}
+						options = append(options, MediaOption{
+							Quality: fmt.Sprintf("Video %s", f.Quality),
+							Format:  "mp4",
+							Size:    "Dinamis",
+							URL:     f.URL,
+						})
+					}
+					if len(options) > 0 {
+						log.Printf("[YouTube RawAPI] mobile site success: %d options\n", len(options))
+						return title, duration, thumbnail, options
+					}
+				}
+			}
+		}
+	}
+
+	log.Printf("[YouTube RawAPI] all strategies failed\n")
+	return "", "", "", nil
+}
+
+func extractTitleFromHTML(html string) string {
+	m := regexp.MustCompile(`<title>(.+?)</title>`).FindStringSubmatch(html)
+	if len(m) > 1 {
+		s := strings.TrimSpace(m[1])
+		if strings.HasSuffix(s, " - YouTube") {
+			s = s[:len(s)-len(" - YouTube")]
+		}
+		return s
+	}
+	return "YouTube Video"
+}
+
+// ─── Method 7: Piped API ───────────────────────────────────────────────────────
 
 type pipedStream struct {
 	URL      string `json:"url"`
@@ -1323,10 +1524,11 @@ func findFFmpeg() string {
 }
 
 var (
-	loadedCookies string
+	loadedCookies   string
+	generatedCookie bool
 )
 
-func findCookiesFile() string {
+func generateYouTubeCookies() string {
 	if loadedCookies != "" {
 		return loadedCookies
 	}
@@ -1337,11 +1539,58 @@ func findCookiesFile() string {
 			return name
 		}
 	}
-	return ""
+	if generatedCookie {
+		return ""
+	}
+	generatedCookie = true
+	req, _ := http.NewRequest("GET", "https://www.youtube.com", nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	var cookies []string
+	for _, c := range resp.Cookies() {
+		if c.Name == "VISITOR_INFO1_LIVE" || c.Name == "YSC" || c.Name == "SOCS" || c.Name == "__Secure-YEC" {
+			cookies = append(cookies, c.Name+"="+c.Value)
+		}
+	}
+	if len(cookies) == 0 {
+		return ""
+	}
+
+	tmpFile := filepath.Join(os.TempDir(), "yt-cookies-"+strconv.FormatInt(time.Now().UnixNano(), 36)+".txt")
+	var lines []string
+	lines = append(lines, "# Netscape HTTP Cookie File")
+	lines = append(lines, ".youtube.com	TRUE	/	TRUE	1735689600	VISITOR_INFO1_LIVE	eMj-Z8IOjns")
+	for _, c := range resp.Cookies() {
+		exp := c.Expires.Unix()
+		if exp <= 0 {
+			exp = 1735689600
+		}
+		lines = append(lines, fmt.Sprintf(".youtube.com	TRUE	/	TRUE	%d	%s	%s", exp, c.Name, c.Value))
+	}
+	if err := os.WriteFile(tmpFile, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
+		return ""
+	}
+
+	go func() { time.Sleep(300 * time.Second); os.Remove(tmpFile) }()
+	loadedCookies = tmpFile
+	log.Printf("[yt-dlp] generated cookies from YouTube response: %d cookies\n", len(resp.Cookies()))
+	return tmpFile
 }
 
 func cookieArgs() []string {
-	if p := findCookiesFile(); p != "" {
+	if p := generateYouTubeCookies(); p != "" {
 		return []string{"--cookies", p}
 	}
 	return nil
