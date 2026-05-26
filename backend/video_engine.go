@@ -189,7 +189,7 @@ func fetchYouTubeVideos(pageURL, platform string) (title string, duration string
 		return fetchYouTubeViaKkdai(pageURL, videoID)
 	}
 
-	// Try yt-dlp with various client configs — try all and pick the one with most options
+	// Try yt-dlp with top client configs — try a few and pick best result
 	type clientResult struct {
 		label   string
 		title   string
@@ -203,14 +203,9 @@ func fetchYouTubeVideos(pageURL, platform string) (title string, duration string
 		args  []string
 	}{
 		{"default", nil},
-		{"web", []string{"--extractor-args", "youtube:player_client=web"}},
 		{"android", []string{"--extractor-args", "youtube:player_client=android"}},
-		{"android_vr", []string{"--extractor-args", "youtube:player_client=android_vr"}},
+		{"web", []string{"--extractor-args", "youtube:player_client=web"}},
 		{"ios", []string{"--extractor-args", "youtube:player_client=ios"}},
-		{"tv_android", []string{"--extractor-args", "youtube:player_client=tv_android"}},
-		{"web_creator", []string{"--extractor-args", "youtube:player_client=web_creator"}},
-		{"default+geo_bypass", []string{"--geo-bypass"}},
-		{"android_skip_webpage", []string{"--extractor-args", "youtube:player_client=android", "--extractor-args", "youtube:skip=webpage"}},
 	}
 	for _, attempt := range clientAttempts {
 		log.Printf("[YouTube] trying yt-dlp with %s client\n", attempt.label)
@@ -485,10 +480,6 @@ func fetchYouTubeViaInvidious(videoID string) (title string, duration string, th
 		"https://yewtu.be",
 		"https://inv.nadeko.net",
 		"https://invidious.slipfox.xyz",
-		"https://vid.puffyan.us",
-		"https://inv.odyssey346.dev",
-		"https://invidious.privacydev.net",
-		"https://invidious.baczek.me",
 	}
 	for _, inst := range instances {
 		apiURL := fmt.Sprintf("%s/api/v1/videos/%s", inst, videoID)
@@ -497,7 +488,7 @@ func fetchYouTubeViaInvidious(videoID string) (title string, duration string, th
 			continue
 		}
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-		client := &http.Client{Timeout: 10 * time.Second}
+		client := &http.Client{Timeout: 5 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil || resp.StatusCode != 200 {
 			if resp != nil {
