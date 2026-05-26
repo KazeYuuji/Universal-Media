@@ -159,6 +159,7 @@ func runYtDlp(pageURL string, extraArgs ...string) (ytDlpInfo, bool) {
 		"-J", "--no-download",
 		"--no-warnings",
 	}
+	args = append(args, cookieArgs()...)
 	args = append(args, extraArgs...)
 	args = append(args, pageURL)
 	cmd := ytDlpCommandContext(ctx, args...)
@@ -604,8 +605,9 @@ func fetchYouTubeViaDirectPipe(pageURL, videoID string) (title string, duration 
 		"-g", "-f", "best[ext=mp4]",
 		"--no-download",
 		"--retries", "3",
-		pageURL,
 	}
+	args = append(args, cookieArgs()...)
+	args = append(args, pageURL)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := ytDlpCommandContext(ctx, args...)
@@ -1190,6 +1192,31 @@ func findFFmpeg() string {
 		}
 	}
 	return "ffmpeg"
+}
+
+var (
+	loadedCookies string
+)
+
+func findCookiesFile() string {
+	if loadedCookies != "" {
+		return loadedCookies
+	}
+	for _, name := range []string{"cookies.txt", "yt-cookies.txt", ".cookies.txt"} {
+		if _, err := os.Stat(name); err == nil {
+			loadedCookies = name
+			log.Printf("[yt-dlp] found cookies file: %s\n", name)
+			return name
+		}
+	}
+	return ""
+}
+
+func cookieArgs() []string {
+	if p := findCookiesFile(); p != "" {
+		return []string{"--cookies", p}
+	}
+	return nil
 }
 
 func findFFprobe() string {
