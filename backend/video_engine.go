@@ -244,7 +244,12 @@ func fetchYouTubeVideos(pageURL, platform string) (title string, duration string
 		return t, d, th, opts
 	}
 
-	log.Printf("[YouTube] kkdai failed, trying Invidious API\n")
+	log.Printf("[YouTube] kkdai failed, trying Piped API\n")
+	if t, d, th, opts := fetchYouTubeViaPiped(videoID); len(opts) > 0 {
+		return t, d, th, opts
+	}
+
+	log.Printf("[YouTube] Piped failed, trying Invidious API\n")
 	if t, d, th, opts := fetchYouTubeViaInvidious(videoID); len(opts) > 0 {
 		return t, d, th, opts
 	}
@@ -433,21 +438,31 @@ func fetchYouTubeViaKkdai(pageURL, videoID string) (title string, duration strin
 	duration = fmt.Sprintf("%d:%02d", dur/60, dur%60)
 
 	ytPage := fmt.Sprintf("https://www.youtube.com/watch?v=%s", videoID)
-	options = append(options, MediaOption{
-		Quality:  "Video (Best Quality)",
-		Format:   "mp4",
-		Size:     "Dinamis",
-		URL:      ytPage,
-		YtFormat: "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
-	})
 
-	options = append(options, MediaOption{
-		Quality:  "Audio Only (MP3)",
-		Format:   "mp3",
-		Size:     "Dinamis",
-		URL:      ytPage,
-		YtFormat: "bestaudio[ext=m4a]",
-	})
+	for _, f := range video.Formats {
+		if f.URL == "" {
+			continue
+		}
+		q := f.Quality
+		if q == "" {
+			q = fmt.Sprintf("itag-%d", f.ItagNo)
+		}
+		options = append(options, MediaOption{
+			Quality: fmt.Sprintf("Video %s", q),
+			Format:  "mp4",
+			Size:    "Dinamis",
+			URL:     f.URL,
+		})
+	}
+	if len(options) == 0 {
+		options = append(options, MediaOption{
+			Quality:  "Video (Best Quality)",
+			Format:   "mp4",
+			Size:     "Dinamis",
+			URL:      ytPage,
+			YtFormat: "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
+		})
+	}
 	return title, duration, thumbnail, options
 }
 
@@ -637,6 +652,108 @@ func fetchYouTubeViaDirectPipe(pageURL, videoID string) (title string, duration 
 		YtFormat: "bestaudio[ext=m4a]",
 	})
 	return title, duration, thumbnail, options
+}
+
+// ─── Method 6: Piped API ───────────────────────────────────────────────────────
+
+type pipedStream struct {
+	URL      string `json:"url"`
+	Quality  string `json:"quality"`
+	MimeType string `json:"mimeType"`
+	Codec    string `json:"codec"`
+	VideoURL string `json:"videoURL"`
+}
+
+type pipedVideo struct {
+	Title         string        `json:"title"`
+	VideoID       string        `json:"videoId"`
+	Duration      int           `json:"duration"`
+	ThumbnailURL  string        `json:"thumbnailUrl"`
+	UploadDate    string        `json:"uploadDate"`
+	VideoStreams  []pipedStream `json:"videoStreams"`
+	AudioStreams  []pipedStream `json:"audioStreams"`
+}
+
+func fetchYouTubeViaPiped(videoID string) (title string, duration string, thumbnail string, options []MediaOption) {
+	instances := []string{
+		"https://pipedapi.kavin.rocks",
+		"https://pipedapi.adminforge.de",
+		"https://pipedapi.smnz.de",
+	}
+	for _, inst := range instances {
+		apiURL := fmt.Sprintf("%s/streams/%s", inst, videoID)
+		req, err := http.NewRequest("GET", apiURL, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil || resp.StatusCode != 200 {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		var vid pipedVideo
+		if json.Unmarshal(body, &vid) != nil {
+			continue
+		}
+		if vid.Title == "" || vid.VideoID == "" {
+			continue
+		}
+		title = vid.Title
+		if vid.Duration > 0 {
+			duration = fmt.Sprintf("%d:%02d", vid.Duration/60, vid.Duration%60)
+		}
+		thumbnail = vid.ThumbnailURL
+		if thumbnail == "" {
+			thumbnail = fmt.Sprintf("https://img.youtube.com/vi/%s/maxresdefault.jpg", videoID)
+		}
+		seen := make(map[string]bool)
+		for _, s := range vid.VideoStreams {
+			if s.URL == "" || seen[s.URL] {
+				continue
+			}
+			seen[s.URL] = true
+			label := fmt.Sprintf("Video %s", s.Quality)
+			if s.Quality == "" {
+				label = "Video"
+			}
+			ext := "mp4"
+			if s.MimeType != "" {
+				ext = detectExtFromURL(s.URL, "mp4")
+			}
+			options = append(options, MediaOption{
+				Quality: label,
+				Format:  ext,
+				Size:    "Dinamis",
+				URL:     s.URL,
+			})
+		}
+		for _, s := range vid.AudioStreams {
+			if s.URL == "" || seen[s.URL] {
+				continue
+			}
+			seen[s.URL] = true
+			options = append(options, MediaOption{
+				Quality: "Audio Only",
+				Format:  "m4a",
+				Size:    "Dinamis",
+				URL:     s.URL,
+			})
+		}
+		if len(options) > 0 {
+			log.Printf("[YouTube] Piped instance %s succeeded: %d options\n", inst, len(options))
+			return title, duration, thumbnail, options
+		}
+	}
+	return "", "", "", nil
 }
 
 // decodeDownloadgramToken decodes the JWT payload from a cdn.downloadgram.org token
