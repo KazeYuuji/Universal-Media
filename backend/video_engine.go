@@ -204,11 +204,10 @@ func fetchYouTubeVideos(pageURL, platform string) (title string, duration string
 		label string
 		args  []string
 	}{
-		{"android+skip", []string{"--extractor-args", "youtube:player_client=android,youtube:skip=webpage", "--retries", "3", "--extractor-retries", "3"}},
-		{"android", []string{"--extractor-args", "youtube:player_client=android", "--retries", "3", "--extractor-retries", "3"}},
-		{"web", []string{"--extractor-args", "youtube:player_client=web", "--retries", "3", "--extractor-retries", "3"}},
-		{"default", []string{"--retries", "3", "--extractor-retries", "3"}},
-		{"ios", []string{"--extractor-args", "youtube:player_client=ios", "--retries", "3", "--extractor-retries", "3"}},
+		{"tv", []string{"--extractor-args", "youtube:player_client=tv,youtube:include_dash_manifest=False", "--retries", "3", "--extractor-retries", "3", "--js-runtimes", "deno", "--force-ipv4"}},
+		{"android+skip", []string{"--extractor-args", "youtube:player_client=android,youtube:skip=webpage", "--retries", "3", "--extractor-retries", "3", "--js-runtimes", "deno", "--force-ipv4"}},
+		{"web", []string{"--extractor-args", "youtube:player_client=web", "--retries", "3", "--extractor-retries", "3", "--js-runtimes", "deno", "--force-ipv4"}},
+		{"default", []string{"--retries", "3", "--extractor-retries", "3", "--js-runtimes", "deno", "--force-ipv4"}},
 	}
 	for _, attempt := range clientAttempts {
 		log.Printf("[YouTube] trying yt-dlp with %s client\n", attempt.label)
@@ -625,6 +624,8 @@ func fetchYouTubeViaDirectPipe(pageURL, videoID string) (title string, duration 
 		"-g", "-f", "best[ext=mp4]",
 		"--no-download",
 		"--retries", "3",
+		"--js-runtimes", "deno",
+		"--force-ipv4",
 	}
 	args = append(args, cookieArgs()...)
 	args = append(args, proxyArgs()...)
@@ -635,7 +636,11 @@ func fetchYouTubeViaDirectPipe(pageURL, videoID string) (title string, duration 
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderrBuf
 	if cmd.Run() != nil {
-		log.Printf("[YouTube DirectPipe] yt-dlp failed: %v | stderr: %s\n", cmd.Err, stderrBuf.String()[:min(200, stderrBuf.Len())])
+		stderrStr := stderrBuf.String()
+		if len(stderrStr) > 500 {
+			stderrStr = stderrStr[:500]
+		}
+		log.Printf("[YouTube DirectPipe] yt-dlp failed: %v | stderr: %s\n", cmd.Err, stderrStr)
 		return "", "", "", nil
 	}
 
