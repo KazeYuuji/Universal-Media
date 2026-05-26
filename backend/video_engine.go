@@ -152,7 +152,7 @@ type sortFormat struct {
 }
 
 func runYtDlp(pageURL string, extraArgs ...string) (ytDlpInfo, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	var stdout, stderrBuf bytes.Buffer
 	args := []string{
@@ -202,10 +202,11 @@ func fetchYouTubeVideos(pageURL, platform string) (title string, duration string
 		label string
 		args  []string
 	}{
-		{"default", nil},
-		{"android", []string{"--extractor-args", "youtube:player_client=android"}},
-		{"web", []string{"--extractor-args", "youtube:player_client=web"}},
-		{"ios", []string{"--extractor-args", "youtube:player_client=ios"}},
+		{"android+skip", []string{"--extractor-args", "youtube:player_client=android,youtube:skip=webpage", "--retries", "3", "--extractor-retries", "3"}},
+		{"android", []string{"--extractor-args", "youtube:player_client=android", "--retries", "3", "--extractor-retries", "3"}},
+		{"web", []string{"--extractor-args", "youtube:player_client=web", "--retries", "3", "--extractor-retries", "3"}},
+		{"default", []string{"--retries", "3", "--extractor-retries", "3"}},
+		{"ios", []string{"--extractor-args", "youtube:player_client=ios", "--retries", "3", "--extractor-retries", "3"}},
 	}
 	for _, attempt := range clientAttempts {
 		log.Printf("[YouTube] trying yt-dlp with %s client\n", attempt.label)
@@ -411,9 +412,9 @@ func buildYouTubeOptionsFromInfo(info ytDlpInfo, videoID string) (title string, 
 
 func fetchYouTubeViaKkdai(pageURL, videoID string) (title string, duration string, thumbnail string, options []MediaOption) {
 	client := yt.Client{
-		HTTPClient: &http.Client{Timeout: 10 * time.Second},
+		HTTPClient: &http.Client{Timeout: 30 * time.Second},
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	video, err := client.GetVideoContext(ctx, pageURL)
@@ -480,6 +481,9 @@ func fetchYouTubeViaInvidious(videoID string) (title string, duration string, th
 		"https://yewtu.be",
 		"https://inv.nadeko.net",
 		"https://invidious.slipfox.xyz",
+		"https://vid.puffyan.us",
+		"https://inv.odyssey346.dev",
+		"https://invidious.privacydev.net",
 	}
 	for _, inst := range instances {
 		apiURL := fmt.Sprintf("%s/api/v1/videos/%s", inst, videoID)
@@ -488,7 +492,7 @@ func fetchYouTubeViaInvidious(videoID string) (title string, duration string, th
 			continue
 		}
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-		client := &http.Client{Timeout: 5 * time.Second}
+		client := &http.Client{Timeout: 10 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil || resp.StatusCode != 200 {
 			if resp != nil {
@@ -599,9 +603,12 @@ func fetchYouTubeViaDirectPipe(pageURL, videoID string) (title string, duration 
 	args := []string{
 		"-g", "-f", "best[ext=mp4]",
 		"--no-download",
+		"--retries", "3",
 		pageURL,
 	}
-	cmd := ytDlpCommand(args...)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := ytDlpCommandContext(ctx, args...)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderrBuf
 	if cmd.Run() != nil {
