@@ -104,6 +104,14 @@ func ytDlpCommand(args ...string) *exec.Cmd {
 	return exec.Command(ytDlpBinary, fullArgs...)
 }
 
+func ytDlpCommandContext(ctx context.Context, args ...string) *exec.Cmd {
+	if !ytDlpInited {
+		initYtDlp()
+	}
+	fullArgs := append(ytDlpModuleArgs, args...)
+	return exec.CommandContext(ctx, ytDlpBinary, fullArgs...)
+}
+
 func ytDlpAvailable() bool {
 	if !ytDlpInited {
 		initYtDlp()
@@ -144,23 +152,29 @@ type sortFormat struct {
 }
 
 func runYtDlp(pageURL string, extraArgs ...string) (ytDlpInfo, bool) {
-	var stdout bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	var stdout, stderrBuf bytes.Buffer
 	args := []string{
 		"-J", "--no-download",
-		"--js-runtimes", "node",
-		"--remote-components", "ejs:github",
+		"--no-warnings",
 	}
 	args = append(args, extraArgs...)
 	args = append(args, pageURL)
-	cmd := ytDlpCommand(args...)
+	cmd := ytDlpCommandContext(ctx, args...)
 	cmd.Stdout = &stdout
-	cmd.Stderr = nil
-	if cmd.Run() != nil {
+	cmd.Stderr = &stderrBuf
+	if err := cmd.Run(); err != nil {
+		log.Printf("[yt-dlp] run failed: %v | stderr: %s\n", err, stderrBuf.String()[:min(200, stderrBuf.Len())])
 		return ytDlpInfo{}, false
 	}
 	var info ytDlpInfo
 	if json.Unmarshal(stdout.Bytes(), &info) != nil {
+		log.Printf("[yt-dlp] JSON parse error, stderr: %s\n", stderrBuf.String()[:min(200, stderrBuf.Len())])
 		return ytDlpInfo{}, false
+	}
+	if len(info.Formats) == 0 {
+		log.Printf("[yt-dlp] no formats found, stderr: %s\n", stderrBuf.String()[:min(200, stderrBuf.Len())])
 	}
 	return info, len(info.Formats) > 0
 }
@@ -593,18 +607,17 @@ func fetchYouTubeViaDirectPipe(pageURL, videoID string) (title string, duration 
 	}
 
 	// Try to get a direct download URL with best format
-	var stdout bytes.Buffer
+	var stdout, stderrBuf bytes.Buffer
 	args := []string{
 		"-g", "-f", "best[ext=mp4]",
 		"--no-download",
-		"--js-runtimes", "node",
-		"--remote-components", "ejs:github",
 		pageURL,
 	}
 	cmd := ytDlpCommand(args...)
 	cmd.Stdout = &stdout
-	cmd.Stderr = nil
+	cmd.Stderr = &stderrBuf
 	if cmd.Run() != nil {
+		log.Printf("[YouTube DirectPipe] yt-dlp failed: %v | stderr: %s\n", cmd.Err, stderrBuf.String()[:min(200, stderrBuf.Len())])
 		return "", "", "", nil
 	}
 
