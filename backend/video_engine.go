@@ -152,7 +152,7 @@ type sortFormat struct {
 }
 
 func runYtDlp(pageURL string, extraArgs ...string) (ytDlpInfo, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	var stdout, stderrBuf bytes.Buffer
 	args := []string{
@@ -173,10 +173,7 @@ func runYtDlp(pageURL string, extraArgs ...string) (ytDlpInfo, bool) {
 		log.Printf("[yt-dlp] JSON parse error, stderr: %s\n", stderrBuf.String()[:min(200, stderrBuf.Len())])
 		return ytDlpInfo{}, false
 	}
-	if len(info.Formats) == 0 {
-		log.Printf("[yt-dlp] no formats found, stderr: %s\n", stderrBuf.String()[:min(200, stderrBuf.Len())])
-	}
-	return info, len(info.Formats) > 0
+	return info, true
 }
 
 func fetchYouTubeVideos(pageURL, platform string) (title string, duration string, thumbnail string, options []MediaOption) {
