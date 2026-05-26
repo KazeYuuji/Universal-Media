@@ -34,6 +34,7 @@ Set env var `NEXT_PUBLIC_BACKEND_URL` = URL Hugging Face backend
 ✅ Instagram — real photo extraction via Downloadgram JWT → CDN URL (2 foto WebP)
 ✅ TikTok — extraction via TikWM API
 ✅ Facebook — extraction via og:video fallback
+✅ Download proxy — error handling fixed: temp file approach (dulu pipe langsung), context timeout 5m, no more broken downloads
 ❌ HF Spaces — YouTube/IG block datacenter IPs (yt-dlp + CDN 403)
 ❌ Instagram rate-limited — Downloadgram API returns 404/400 after ~10 requests, retry with 2s delay
 
@@ -43,6 +44,7 @@ Set env var `NEXT_PUBLIC_BACKEND_URL` = URL Hugging Face backend
 - **yt-dlp**: Deteksi via PATH → WinGet → python3/python -m yt_dlp
 - **Downloadgram JWT**: Decode token, ekstrak CDN URL langsung dari Instagram
 - **Tanpa simulasi**: Semua opsi adalah format real, bukan URL palsu
+- **Download proxy — temp file**: Download ke file sementara dulu (bukan pipe stdout), baru kirim headers + ServeFile jika sukses. Cleanup via `defer os.Remove`. Context timeout 5 menit, tidak ada lagi partial download.
 
-## Security (7 Layer)
+## Sec (7 Layer)
 Rate limiting (30/10 req/s), SSRF protection, input validation, security headers, panic recovery, request logging, middleware chain.

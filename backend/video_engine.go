@@ -152,7 +152,7 @@ type sortFormat struct {
 }
 
 func runYtDlp(pageURL string, extraArgs ...string) (ytDlpInfo, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 	var stdout, stderrBuf bytes.Buffer
 	args := []string{

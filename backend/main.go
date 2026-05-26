@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -518,29 +519,33 @@ func handleYtDlpDownload(w http.ResponseWriter, r *http.Request, pageURL, ytForm
 
 	isAudioOnly := strings.HasPrefix(ytFormat, "bestaudio") || strings.Contains(ytFormat, "mp3")
 	needsMerge := strings.Contains(ytFormat, "+")
-	setContentDisposition := func(ext string) {
-		if !strings.HasSuffix(filename, "."+ext) {
-			filename += "." + ext
-		}
+
+	setContentType := func() {
 		if isAudioOnly {
 			w.Header().Set("Content-Type", "audio/mpeg")
 		} else {
 			w.Header().Set("Content-Type", "video/mp4")
 		}
+	}
+	setDisposition := func(ext string) {
+		if !strings.HasSuffix(filename, "."+ext) {
+			filename += "." + ext
+		}
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
 	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
 
 	args := []string{
 		"--quiet",
 		"--no-warnings",
 		"--no-progress",
-		"--js-runtimes", "node",
-		"--remote-components", "ejs:github",
 		"-f", ytFormat,
 	}
 	if needsMerge {
 		tmpPath := filepath.Join(os.TempDir(), "ytdl-"+strconv.FormatInt(time.Now().UnixNano(), 36)+".mp4")
-		go func() { time.Sleep(10 * time.Second); os.Remove(tmpPath) }()
+		defer os.Remove(tmpPath)
 
 		args = append(args, "--merge-output-format", "mp4", "-o", tmpPath)
 		if _, err := os.Stat(ffmpegPath); err == nil {
@@ -548,7 +553,7 @@ func handleYtDlpDownload(w http.ResponseWriter, r *http.Request, pageURL, ytForm
 		}
 		args = append(args, pageURL)
 
-		cmd := ytDlpCommand(args...)
+		cmd := ytDlpCommandContext(ctx, args...)
 		var stderrBuf bytes.Buffer
 		cmd.Stderr = &stderrBuf
 		if err := cmd.Run(); err != nil {
@@ -557,42 +562,54 @@ func handleYtDlpDownload(w http.ResponseWriter, r *http.Request, pageURL, ytForm
 			return
 		}
 
-		if _, err := os.Stat(tmpPath); err != nil || os.IsNotExist(err) {
+		if _, err := os.Stat(tmpPath); err != nil {
 			log.Printf("[ytdlp] merged file not found at %s", tmpPath)
 			http.Error(w, "Download failed: merged file not found", http.StatusInternalServerError)
 			return
 		}
 
+		setContentType()
 		if isAudioOnly {
-			setContentDisposition("mp3")
+			setDisposition("mp3")
 		} else {
-			setContentDisposition("mp4")
+			setDisposition("mp4")
 		}
-
 		http.ServeFile(w, r, tmpPath)
 		return
 	}
 
-	// Single format: pipe directly
-	args = append(args, "-o", "-")
+	// Single format: pipe directly via temp file to handle errors gracefully
+	tmpPath := filepath.Join(os.TempDir(), "ytdl-"+strconv.FormatInt(time.Now().UnixNano(), 36)+".tmp")
+	defer os.Remove(tmpPath)
+
+	args = append(args, "-o", tmpPath)
 	if _, err := os.Stat(ffmpegPath); err == nil {
 		args = append(args, "--ffmpeg-location", ffmpegPath)
 	}
 	args = append(args, pageURL)
 
-	if isAudioOnly {
-		setContentDisposition("mp3")
-	} else {
-		setContentDisposition("mp4")
-	}
-
-	cmd := ytDlpCommand(args...)
-	cmd.Stdout = w
+	cmd := ytDlpCommandContext(ctx, args...)
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 	if err := cmd.Run(); err != nil {
 		log.Printf("[ytdlp] download failed: %v, stderr: %s", err, stderrBuf.String())
+		http.Error(w, "Download failed", http.StatusInternalServerError)
+		return
 	}
+
+	if _, err := os.Stat(tmpPath); err != nil {
+		log.Printf("[ytdlp] output file not found at %s", tmpPath)
+		http.Error(w, "Download failed: output not found", http.StatusInternalServerError)
+		return
+	}
+
+	setContentType()
+	if isAudioOnly {
+		setDisposition("mp3")
+	} else {
+		setDisposition("mp4")
+	}
+	http.ServeFile(w, r, tmpPath)
 }
 
 type ytOEmbed struct {
