@@ -544,6 +544,7 @@ func handleYtDlpDownload(w http.ResponseWriter, r *http.Request, pageURL, ytForm
 		"-f", ytFormat,
 	}
 	args = append(args, cookieArgs()...)
+	args = append(args, proxyArgs()...)
 	if needsMerge {
 		tmpPath := filepath.Join(os.TempDir(), "ytdl-"+strconv.FormatInt(time.Now().UnixNano(), 36)+".mp4")
 		defer os.Remove(tmpPath)

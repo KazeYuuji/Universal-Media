@@ -160,6 +160,7 @@ func runYtDlp(pageURL string, extraArgs ...string) (ytDlpInfo, bool) {
 		"--no-warnings",
 	}
 	args = append(args, cookieArgs()...)
+	args = append(args, proxyArgs()...)
 	args = append(args, extraArgs...)
 	args = append(args, pageURL)
 	cmd := ytDlpCommandContext(ctx, args...)
@@ -425,7 +426,11 @@ func fetchYouTubeViaKkdai(pageURL, videoID string) (title string, duration strin
 
 	video, err := client.GetVideoContext(ctx, pageURL)
 	if err != nil {
-		log.Printf("[YouTube] kkdai error: %v\n", err)
+		if strings.Contains(err.Error(), "TLS handshake timeout") || strings.Contains(err.Error(), "context deadline exceeded") {
+			log.Printf("[YouTube] kkdai network error (HF Spaces may be blocking YouTube): %v\n", err)
+		} else {
+			log.Printf("[YouTube] kkdai error: %v\n", err)
+		}
 		return "", "", "", nil
 	}
 
@@ -622,6 +627,7 @@ func fetchYouTubeViaDirectPipe(pageURL, videoID string) (title string, duration 
 		"--retries", "3",
 	}
 	args = append(args, cookieArgs()...)
+	args = append(args, proxyArgs()...)
 	args = append(args, pageURL)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -1332,6 +1338,16 @@ func findCookiesFile() string {
 func cookieArgs() []string {
 	if p := findCookiesFile(); p != "" {
 		return []string{"--cookies", p}
+	}
+	return nil
+}
+
+func proxyArgs() []string {
+	if p := os.Getenv("HTTP_PROXY"); p != "" {
+		return []string{"--proxy", p}
+	}
+	if p := os.Getenv("HTTPS_PROXY"); p != "" {
+		return []string{"--proxy", p}
 	}
 	return nil
 }
