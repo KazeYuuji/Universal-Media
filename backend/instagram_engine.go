@@ -6,6 +6,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"path"
 	"regexp"
 	"strings"
 	"time"
@@ -624,6 +626,221 @@ func fetchIGViaOEmbed(pageURL string) (title string, thumbnail string, options [
 	return title, thumbnail, options, nil
 }
 
+// ─── Method 7: Direct Instagram page scrape ───────────────────────────────────
+
+func fetchIGViaDirectPage(pageURL string) (title string, thumbnail string, options []MediaOption, err error) {
+	html, err := fetchPageHTML(pageURL, "https://www.instagram.com/")
+	if err != nil {
+		return "", "", nil, err
+	}
+
+	title = extractFirstMeta(html, "og:title", "twitter:title")
+	if title == "" {
+		title = "Instagram Post"
+	}
+
+	seen := make(map[string]bool)
+	photoCount := 0
+
+	addPhoto := func(imgURL, label string) {
+		if imgURL == "" {
+			return
+		}
+		imgURL = decodeHTMLEntities(strings.ReplaceAll(imgURL, `\u0026`, "&"))
+		key := normalizeURLForDedup(imgURL)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		photoCount++
+		if label == "" {
+			label = fmt.Sprintf("Foto %d - Resolusi Penuh", photoCount)
+		}
+		if thumbnail == "" {
+			thumbnail = imgURL
+		}
+		options = append(options, MediaOption{Quality: label, Format: "jpg", Size: "Dinamis", URL: imgURL})
+	}
+
+	// Pattern 1: og:image meta tag
+	if og := extractFirstMeta(html, "og:image:secure_url", "og:image"); og != "" {
+		addPhoto(og, "Foto Resolusi Penuh")
+	}
+
+	// Pattern 2: JSON-LD embedded data
+	reJSONLD := regexp.MustCompile(`<script type="application/ld\+json">(.*?)</script>`)
+	for _, m := range reJSONLD.FindAllStringSubmatch(html, -1) {
+		if len(m) > 1 {
+			var ldData struct {
+				Image string `json:"image"`
+			}
+			if json.Unmarshal([]byte(m[1]), &ldData) == nil && ldData.Image != "" {
+				addPhoto(ldData.Image, "Foto Resolusi Penuh")
+			}
+		}
+	}
+
+	// Pattern 3: Extract from __NEXT_DATA__ or similar JSON blobs
+	reNextData := regexp.MustCompile(`<script[^>]*>window\.__INITIAL_STATE__\s*=\s*({.*?});</script>`)
+	if m := reNextData.FindStringSubmatch(html); len(m) > 1 {
+		var initState struct {
+			MediaItems []struct {
+				DisplayURL string `json:"display_url"`
+				IsVideo    bool   `json:"is_video"`
+			} `json:"media_items"`
+		}
+		if json.Unmarshal([]byte(m[1]), &initState) == nil {
+			for _, item := range initState.MediaItems {
+				if item.DisplayURL != "" && !item.IsVideo {
+					addPhoto(item.DisplayURL, fmt.Sprintf("Foto %d - Resolusi Penuh", photoCount+1))
+				}
+			}
+		}
+	}
+
+	// Pattern 4: Raw CDN URLs in the HTML
+	reCDN := regexp.MustCompile(`https://[^"'\s\\]+(?:scontent|cdninstagram)[^"'\s\\]+(?:jpg|jpeg|png|webp)[^"'\s\\]*`)
+	for _, u := range reCDN.FindAllString(html, -1) {
+		u = decodeHTMLEntities(strings.TrimSuffix(u, "\\"))
+		if strings.Contains(u, "emoji") || strings.Contains(u, "profile") || strings.Contains(u, "static.cdninstagram.com") {
+			continue
+		}
+		p, err := url.Parse(u)
+		if err == nil {
+			ext := strings.ToLower(strings.TrimPrefix(path.Ext(p.Path), "."))
+			if ext == "jpg" || ext == "jpeg" || ext == "png" || ext == "webp" {
+				addPhoto(u, fmt.Sprintf("Foto %d - Resolusi Penuh", photoCount+1))
+			}
+		}
+	}
+
+	if len(options) == 0 {
+		return "", "", nil, fmt.Errorf("no images found via direct page scrape")
+	}
+	if len(options) > 1 {
+		for i := range options {
+			options[i].Quality = fmt.Sprintf("Foto %d - Resolusi Penuh", i+1)
+		}
+	}
+	return title, thumbnail, options, nil
+}
+
+// ─── Method 8: Snapinsta for images ──────────────────────────────────────────
+
+func fetchIGViaSnapinstaImages(pageURL string) (title string, thumbnail string, options []MediaOption, err error) {
+	client := &http.Client{Timeout: 20 * time.Second}
+
+	homeReq, _ := http.NewRequest("GET", "https://snapinsta.app/", nil)
+	homeReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+	homeResp, err := client.Do(homeReq)
+	if err != nil {
+		return "", "", nil, err
+	}
+	defer homeResp.Body.Close()
+	homeBody, _ := io.ReadAll(homeResp.Body)
+	tokenRe := regexp.MustCompile(`name="token"\s+value="([^"]+)"`)
+	tokenMatch := tokenRe.FindStringSubmatch(string(homeBody))
+	if len(tokenMatch) < 2 {
+		return "", "", nil, fmt.Errorf("no snapinsta token found")
+	}
+	token := tokenMatch[1]
+
+	form := url.Values{
+		"url":   {cleanPageURL(pageURL)},
+		"token": {token},
+		"lang":  {"en"},
+	}
+	postReq, _ := http.NewRequest("POST", "https://snapinsta.app/action.php", strings.NewReader(form.Encode()))
+	postReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	postReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+	postReq.Header.Set("Referer", "https://snapinsta.app/")
+	postReq.Header.Set("Origin", "https://snapinsta.app")
+	postReq.Header.Set("X-Requested-With", "XMLHttpRequest")
+
+	postResp, err := client.Do(postReq)
+	if err != nil {
+		return "", "", nil, err
+	}
+	defer postResp.Body.Close()
+	postBody, _ := io.ReadAll(postResp.Body)
+	html := string(postBody)
+
+	seen := make(map[string]bool)
+	photoCount := 0
+	addPhoto := func(imgURL string) {
+		if imgURL == "" || seen[imgURL] {
+			return
+		}
+		imgURL = decodeHTMLEntities(imgURL)
+		key := normalizeURLForDedup(imgURL)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		photoCount++
+		if thumbnail == "" {
+			thumbnail = imgURL
+		}
+		options = append(options, MediaOption{
+			Quality: fmt.Sprintf("Foto %d - Resolusi Penuh", photoCount),
+			Format:  "jpg",
+			Size:    "Dinamis",
+			URL:     imgURL,
+		})
+	}
+
+	// Snapinsta image patterns
+	reImg := regexp.MustCompile(`<img[^>]+class="[^"]*photo[^"]*"[^>]+src="([^"]+)"`)
+	for _, m := range reImg.FindAllStringSubmatch(html, -1) {
+		if len(m) > 1 {
+			addPhoto(m[1])
+		}
+	}
+
+	reDataURL := regexp.MustCompile(`data-url="(https://[^"]+)"`)
+	for _, m := range reDataURL.FindAllStringSubmatch(html, -1) {
+		if len(m) > 1 {
+			u := decodeHTMLEntities(m[1])
+			if p, e := url.Parse(u); e == nil {
+				ext := strings.ToLower(strings.TrimPrefix(path.Ext(p.Path), "."))
+				if isImageExt(ext) {
+					addPhoto(u)
+				}
+			}
+		}
+	}
+
+	// Direct href links with image extensions
+	reHref := regexp.MustCompile(`href="(https://[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"`)
+	for _, m := range reHref.FindAllStringSubmatch(html, -1) {
+		if len(m) > 1 {
+			u := decodeHTMLEntities(m[1])
+			if p, e := url.Parse(u); e == nil {
+				ext := strings.ToLower(strings.TrimPrefix(path.Ext(p.Path), "."))
+				if isImageExt(ext) {
+					addPhoto(u)
+				}
+			}
+		}
+	}
+
+	// Fallback: og:image from snapinsta's response
+	if len(options) == 0 {
+		if og := extractFirstMeta(html, "og:image"); og != "" {
+			addPhoto(og)
+		}
+	}
+
+	if len(options) == 0 {
+		return "", "", nil, fmt.Errorf("snapinsta found no images")
+	}
+	title = extractFirstMeta(html, "og:title")
+	if title == "" {
+		title = "Instagram Photo"
+	}
+	return title, thumbnail, options, nil
+}
+
 // ─── Main Instagram engine ────────────────────────────────────────────────────
 
 func fetchInstagramImages(pageURL string) (title string, thumbnail string, options []MediaOption) {
@@ -640,11 +857,6 @@ func fetchInstagramImages(pageURL string) (title string, thumbnail string, optio
 	}
 
 	methods := []method{
-		{"GraphQL API", func() (string, string, []MediaOption, error) { return fetchIGViaGraphQL(shortcode) }},
-		{"Mobile API", func() (string, string, []MediaOption, error) { return fetchIGViaMobileAPI(shortcode) }},
-		{"Embed JSON", func() (string, string, []MediaOption, error) { return fetchIGViaEmbedJSON(shortcode) }},
-		{"Embed Scraping", func() (string, string, []MediaOption, error) { return fetchIGViaEmbed(shortcode) }},
-		{"Public Viewer", func() (string, string, []MediaOption, error) { return fetchIGViaPublicViewer(shortcode) }},
 		{"Downloadgram", func() (string, string, []MediaOption, error) {
 			t, opts := fetchDownloadgramImages(pageURL)
 			if len(opts) == 0 {
@@ -652,7 +864,14 @@ func fetchInstagramImages(pageURL string) (title string, thumbnail string, optio
 			}
 			return t, opts[0].URL, opts, nil
 		}},
+		{"GraphQL API", func() (string, string, []MediaOption, error) { return fetchIGViaGraphQL(shortcode) }},
+		{"Mobile API", func() (string, string, []MediaOption, error) { return fetchIGViaMobileAPI(shortcode) }},
+		{"Embed JSON", func() (string, string, []MediaOption, error) { return fetchIGViaEmbedJSON(shortcode) }},
+		{"Embed Scraping", func() (string, string, []MediaOption, error) { return fetchIGViaEmbed(shortcode) }},
+		{"Public Viewer", func() (string, string, []MediaOption, error) { return fetchIGViaPublicViewer(shortcode) }},
 		{"oEmbed", func() (string, string, []MediaOption, error) { return fetchIGViaOEmbed(pageURL) }},
+		{"Direct Page", func() (string, string, []MediaOption, error) { return fetchIGViaDirectPage(pageURL) }},
+		{"Snapinsta Images", func() (string, string, []MediaOption, error) { return fetchIGViaSnapinstaImages(pageURL) }},
 	}
 
 	for _, m := range methods {
@@ -660,12 +879,15 @@ func fetchInstagramImages(pageURL string) (title string, thumbnail string, optio
 		t, th, opts, err := m.fn()
 		if err == nil && len(opts) > 0 {
 			log.Printf("[IG] %s berhasil: %d foto (sebelum filter)\n", m.name, len(opts))
-			// Apply final deduplication filter
 			filteredOpts := filterImageOptions(opts)
 			log.Printf("[IG] %s berhasil: %d foto (setelah filter)\n", m.name, len(filteredOpts))
 			return t, th, filteredOpts
 		}
-		log.Printf("[IG] %s gagal: %v\n", m.name, err)
+		if err != nil {
+			log.Printf("[IG] %s gagal: %v\n", m.name, err)
+		} else {
+			log.Printf("[IG] %s gagal: 0 options returned\n", m.name)
+		}
 	}
 
 	return "", "", nil

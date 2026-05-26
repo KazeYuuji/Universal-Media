@@ -51,21 +51,68 @@ func fetchYouTubeThumbnailsOnly(videoID string) (title string, duration string, 
 	return title, duration, thumbnail, options
 }
 
-func findYtDlp() string {
+var (
+	ytDlpBinary     string
+	ytDlpModuleArgs []string
+	ytDlpInited     bool
+)
+
+func initYtDlp() {
+	ytDlpInited = true
 	if p, err := exec.LookPath("yt-dlp"); err == nil && p != "" {
-		return p
+		ytDlpBinary = p
+		ytDlpModuleArgs = nil
+		return
 	}
 	candidates := []string{
 		filepath.Join(os.Getenv("LOCALAPPDATA"), "Packages", "PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0", "LocalCache", "local-packages", "Python313", "Scripts", "yt-dlp.exe"),
 		filepath.Join(os.Getenv("LOCALAPPDATA"), "Microsoft", "WinGet", "Packages", "yt-dlp.yt-dlp_Microsoft.Winget.Source_8wekyb3d8bbwe", "yt-dlp.exe"),
-		"yt-dlp",
 	}
 	for _, c := range candidates {
 		if _, err := os.Stat(c); err == nil {
-			return c
+			ytDlpBinary = c
+			ytDlpModuleArgs = nil
+			return
 		}
 	}
-	return "yt-dlp"
+	if p, err := exec.LookPath("python3"); err == nil && p != "" {
+		cmd := exec.Command(p, "-m", "yt_dlp", "--version")
+		if cmd.Run() == nil {
+			ytDlpBinary = p
+			ytDlpModuleArgs = []string{"-m", "yt_dlp"}
+			return
+		}
+	}
+	ytDlpBinary = "yt-dlp"
+	ytDlpModuleArgs = nil
+}
+
+func findYtDlp() string {
+	if !ytDlpInited {
+		initYtDlp()
+	}
+	return ytDlpBinary
+}
+
+func ytDlpCommand(args ...string) *exec.Cmd {
+	if !ytDlpInited {
+		initYtDlp()
+	}
+	fullArgs := append(ytDlpModuleArgs, args...)
+	return exec.Command(ytDlpBinary, fullArgs...)
+}
+
+func ytDlpAvailable() bool {
+	if !ytDlpInited {
+		initYtDlp()
+	}
+	if ytDlpModuleArgs != nil {
+		return true
+	}
+	if _, err := os.Stat(ytDlpBinary); err == nil {
+		return true
+	}
+	return false
 }
 
 type ytDlpFormat struct {
@@ -102,7 +149,7 @@ func runYtDlp(pageURL string, extraArgs ...string) (ytDlpInfo, bool) {
 	}
 	args = append(args, extraArgs...)
 	args = append(args, pageURL)
-	cmd := exec.Command(findYtDlp(), args...)
+	cmd := ytDlpCommand(args...)
 	cmd.Stdout = &stdout
 	cmd.Stderr = nil
 	if cmd.Run() != nil {
@@ -123,13 +170,12 @@ func fetchYouTubeVideos(pageURL, platform string) (title string, duration string
 	}
 	log.Printf("[YouTube] Video ID: %s\n", videoID)
 
-	ytDlpPath := findYtDlp()
-	if _, err := os.Stat(ytDlpPath); err != nil {
-		log.Printf("[YouTube] yt-dlp not found at %s, using kkdai fallback\n", ytDlpPath)
+	if !ytDlpAvailable() {
+		log.Printf("[YouTube] yt-dlp not found, using kkdai fallback\n")
 		return fetchYouTubeViaKkdai(pageURL, videoID)
 	}
 
-	// Try multiple yt-dlp client configs — Android client often bypasses login requirement
+	// Try multiple yt-dlp client configs — try all known clients for maximum compatibility
 	clientAttempts := []struct {
 		label string
 		args  []string
@@ -137,6 +183,14 @@ func fetchYouTubeVideos(pageURL, platform string) (title string, duration string
 		{"android", []string{"--extractor-args", "youtube:player_client=android"}},
 		{"android_vr", []string{"--extractor-args", "youtube:player_client=android_vr"}},
 		{"web", []string{"--extractor-args", "youtube:player_client=web"}},
+		{"ios", []string{"--extractor-args", "youtube:player_client=ios"}},
+		{"tv_android", []string{"--extractor-args", "youtube:player_client=tv_android"}},
+		{"web_creator", []string{"--extractor-args", "youtube:player_client=web_creator"}},
+		{"android_skip_webpage", []string{"--extractor-args", "youtube:player_client=android", "--extractor-args", "youtube:skip=webpage"}},
+		{"android_no_dash", []string{"--extractor-args", "youtube:player_client=android", "--extractor-args", "youtube:include_dash_manifest=False"}},
+		{"default+geo_bypass", []string{"--geo-bypass"}},
+		{"default+no_dash", []string{"--extractor-args", "youtube:include_dash_manifest=False"}},
+		{"default+skip_webpage", []string{"--extractor-args", "youtube:skip=webpage"}},
 		{"default", nil},
 	}
 	for _, attempt := range clientAttempts {
@@ -162,6 +216,17 @@ func fetchYouTubeVideos(pageURL, platform string) (title string, duration string
 	if t, d, th, opts := fetchYouTubeViaKkdai(pageURL, videoID); len(opts) > 0 {
 		return t, d, th, opts
 	}
+
+	log.Printf("[YouTube] kkdai failed, trying Invidious API\n")
+	if t, d, th, opts := fetchYouTubeViaInvidious(videoID); len(opts) > 0 {
+		return t, d, th, opts
+	}
+
+	log.Printf("[YouTube] Invidious failed, trying direct format fetch\n")
+	if t, d, th, opts := fetchYouTubeViaDirectPipe(pageURL, videoID); len(opts) > 0 {
+		return t, d, th, opts
+	}
+
 	// All real extraction methods failed.
 	return "", "", "", nil
 }
@@ -348,6 +413,192 @@ func fetchYouTubeViaKkdai(pageURL, videoID string) (title string, duration strin
 		Format:   "mp3",
 		Size:     "Dinamis",
 		URL:      ytPage,
+		YtFormat: "bestaudio[ext=m4a]",
+	})
+	return title, duration, thumbnail, options
+}
+
+// ─── Method 4: Invidious API ──────────────────────────────────────────────────
+
+type invidiousFormat struct {
+	URL  string `json:"url"`
+	Type string `json:"type"`
+	Quality string `json:"quality"`
+	Bitrate int    `json:"bitrate"`
+	Encoding string `json:"encoding"`
+}
+
+type invidiousVideo struct {
+	Title       string             `json:"title"`
+	VideoID     string             `json:"videoId"`
+	Length      float64            `json:"lengthSeconds"`
+	FormatStreams []invidiousFormat `json:"formatStreams"`
+	AdaptiveFormats []invidiousFormat `json:"adaptiveFormats"`
+	Author      string             `json:"author"`
+	VideoThumbnails []struct {
+		URL      string `json:"url"`
+		Quality  string `json:"quality"`
+		Width    int    `json:"width"`
+		Height   int    `json:"height"`
+	} `json:"videoThumbnails"`
+}
+
+func fetchYouTubeViaInvidious(videoID string) (title string, duration string, thumbnail string, options []MediaOption) {
+	instances := []string{
+		"https://invidious.projectsegfau.lt",
+		"https://yewtu.be",
+		"https://inv.nadeko.net",
+		"https://invidious.slipfox.xyz",
+		"https://vid.puffyan.us",
+		"https://inv.odyssey346.dev",
+		"https://invidious.privacydev.net",
+		"https://invidious.baczek.me",
+	}
+	for _, inst := range instances {
+		apiURL := fmt.Sprintf("%s/api/v1/videos/%s", inst, videoID)
+		req, err := http.NewRequest("GET", apiURL, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil || resp.StatusCode != 200 {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		var vid invidiousVideo
+		if json.Unmarshal(body, &vid) != nil {
+			continue
+		}
+		if vid.Title == "" {
+			continue
+		}
+		title = vid.Title
+		if vid.Length > 0 {
+			duration = fmt.Sprintf("%d:%02d", int(vid.Length)/60, int(vid.Length)%60)
+		}
+		if len(vid.VideoThumbnails) > 0 {
+			thumbnail = vid.VideoThumbnails[len(vid.VideoThumbnails)-1].URL
+		}
+		if thumbnail == "" {
+			thumbnail = fmt.Sprintf("https://img.youtube.com/vi/%s/maxresdefault.jpg", videoID)
+		}
+
+		seen := make(map[string]bool)
+		for _, f := range vid.FormatStreams {
+			if f.URL == "" || seen[f.URL] {
+				continue
+			}
+			seen[f.URL] = true
+			q := strings.ToLower(f.Quality)
+			isHD := strings.Contains(q, "hd") || strings.Contains(q, "1080") || strings.Contains(q, "720")
+			isSD := strings.Contains(q, "480") || strings.Contains(q, "360")
+			label := "Video"
+			if isHD {
+				label += " HD"
+			} else if isSD {
+				label += " SD"
+			}
+			if f.Quality != "" {
+				label += " (" + f.Quality + ")"
+			}
+			options = append(options, MediaOption{
+				Quality: label,
+				Format:  detectExtFromURL(f.URL, "mp4"),
+				Size:    "Dinamis",
+				URL:     f.URL,
+			})
+		}
+		for _, f := range vid.AdaptiveFormats {
+			if f.URL == "" || seen[f.URL] {
+				continue
+			}
+			seen[f.URL] = true
+			isAudio := strings.Contains(f.Type, "audio")
+			if isAudio {
+				options = append(options, MediaOption{
+					Quality: "Audio Only (Invidious)",
+					Format:  "m4a",
+					Size:    "Dinamis",
+					URL:     f.URL,
+				})
+			} else {
+				label := "Video Adaptive"
+				if f.Quality != "" {
+					label += " (" + f.Quality + ")"
+				}
+				options = append(options, MediaOption{
+					Quality: label,
+					Format:  detectExtFromURL(f.URL, "mp4"),
+					Size:    "Dinamis",
+					URL:     f.URL,
+				})
+			}
+		}
+		if len(options) > 0 {
+			log.Printf("[YouTube] Invidious instance %s succeeded: %d options\n", inst, len(options))
+			return title, duration, thumbnail, options
+		}
+	}
+	return "", "", "", nil
+}
+
+// ─── Method 5: Direct yt-dlp pipe (format best) ──────────────────────────────
+
+func fetchYouTubeViaDirectPipe(pageURL, videoID string) (title string, duration string, thumbnail string, options []MediaOption) {
+	if !ytDlpAvailable() {
+		return "", "", "", nil
+	}
+
+	// Get oEmbed metadata for title/thumbnail
+	title, thumbnail = fetchYouTubeOEmbed(pageURL)
+	if title == "" {
+		title = "YouTube Video"
+	}
+	if thumbnail == "" {
+		thumbnail = fmt.Sprintf("https://img.youtube.com/vi/%s/maxresdefault.jpg", videoID)
+	}
+
+	// Try to get a direct download URL with best format
+	var stdout bytes.Buffer
+	args := []string{
+		"-g", "-f", "best[ext=mp4]",
+		"--no-download",
+		"--js-runtimes", "node",
+		"--remote-components", "ejs:github",
+		pageURL,
+	}
+	cmd := ytDlpCommand(args...)
+	cmd.Stdout = &stdout
+	cmd.Stderr = nil
+	if cmd.Run() != nil {
+		return "", "", "", nil
+	}
+
+	directURL := strings.TrimSpace(stdout.String())
+	if directURL == "" {
+		return "", "", "", nil
+	}
+
+	options = append(options, MediaOption{
+		Quality: "Video (Best Quality - Direct)",
+		Format:  "mp4",
+		Size:    "Dinamis",
+		URL:     directURL,
+	})
+	options = append(options, MediaOption{
+		Quality: "Audio Only (Best - Direct)",
+		Format:  "m4a",
+		Size:    "Dinamis",
+		URL:     directURL,
 		YtFormat: "bestaudio[ext=m4a]",
 	})
 	return title, duration, thumbnail, options

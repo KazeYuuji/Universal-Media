@@ -256,6 +256,7 @@ func proxyDownloadHandler(w http.ResponseWriter, r *http.Request) {
 	// Set correct Referer per CDN origin
 	host := strings.ToLower(parsed.Host)
 	var referer string
+	var extraHeaders map[string]string
 	switch {
 	case strings.Contains(host, "tiktokcdn") || strings.Contains(host, "tiktok-obj") ||
 		strings.Contains(host, "tiktokv.com") || strings.Contains(host, "tiktokcdn-us"):
@@ -264,12 +265,22 @@ func proxyDownloadHandler(w http.ResponseWriter, r *http.Request) {
 		referer = "https://downloadgram.org/"
 	case strings.Contains(host, "cdninstagram") || strings.Contains(host, "scontent") || strings.Contains(host, "fbcdn"):
 		referer = "https://www.instagram.com/"
+		extraHeaders = map[string]string{
+			"Origin": "https://www.instagram.com",
+			"Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+			"Sec-Fetch-Site": "cross-site",
+			"Sec-Fetch-Mode": "no-cors",
+			"Sec-Fetch-Dest": "image",
+		}
 	case strings.Contains(host, "googlevideo") || strings.Contains(host, "youtube"):
 		referer = "https://www.youtube.com/"
 	default:
 		referer = parsed.Scheme + "://" + parsed.Host + "/"
 	}
 	req.Header.Set("Referer", referer)
+	for k, v := range extraHeaders {
+		req.Header.Set(k, v)
+	}
 
 	client := &http.Client{
 		Timeout: 60 * time.Second,
@@ -493,8 +504,7 @@ func isAudioExt(ext string) bool {
 }
 
 func handleYtDlpDownload(w http.ResponseWriter, r *http.Request, pageURL, ytFormat string) {
-	ytDlpPath := findYtDlp()
-	if _, err := os.Stat(ytDlpPath); err != nil {
+	if !ytDlpAvailable() {
 		http.Error(w, "yt-dlp not available on server", http.StatusServiceUnavailable)
 		return
 	}
@@ -538,7 +548,7 @@ func handleYtDlpDownload(w http.ResponseWriter, r *http.Request, pageURL, ytForm
 		}
 		args = append(args, pageURL)
 
-		cmd := exec.Command(ytDlpPath, args...)
+		cmd := ytDlpCommand(args...)
 		var stderrBuf bytes.Buffer
 		cmd.Stderr = &stderrBuf
 		if err := cmd.Run(); err != nil {
@@ -576,7 +586,7 @@ func handleYtDlpDownload(w http.ResponseWriter, r *http.Request, pageURL, ytForm
 		setContentDisposition("mp4")
 	}
 
-	cmd := exec.Command(ytDlpPath, args...)
+	cmd := ytDlpCommand(args...)
 	cmd.Stdout = w
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
@@ -684,6 +694,7 @@ func fetchDownloadgramImages(pageURL string) (title string, options []MediaOptio
 	form := url.Values{"url": {cleanPageURL(pageURL)}}
 	req, err := http.NewRequest("POST", "https://api.downloadgram.org/media", strings.NewReader(form.Encode()))
 	if err != nil {
+		log.Printf("[Downloadgram] request creation error: %v\n", err)
 		return "", nil
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -692,15 +703,39 @@ func fetchDownloadgramImages(pageURL string) (title string, options []MediaOptio
 	req.Header.Set("Referer", "https://downloadgram.org/")
 
 	client := &http.Client{Timeout: 25 * time.Second}
-	resp, err := client.Do(req)
+
+	doRequest := func() (*http.Response, []byte, error) {
+		r, e := client.Do(req)
+		if e != nil {
+			return nil, nil, e
+		}
+		defer r.Body.Close()
+		b, e := io.ReadAll(r.Body)
+		return r, b, e
+	}
+
+	resp, body, err := doRequest()
 	if err != nil {
 		log.Printf("[Downloadgram] request error: %v\n", err)
 		return "", nil
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", nil
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		bodyStr := string(body)
+		if len(bodyStr) > 500 { bodyStr = bodyStr[:500] }
+		log.Printf("[Downloadgram] HTTP %d, %d bytes (will retry after 2s): %s\n", resp.StatusCode, len(body), bodyStr)
+		time.Sleep(2 * time.Second)
+		// Retry once
+		resp, body, err = doRequest()
+		if err != nil {
+			log.Printf("[Downloadgram] retry error: %v\n", err)
+			return "", nil
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			bodyStr := string(body)
+			if len(bodyStr) > 500 { bodyStr = bodyStr[:500] }
+			log.Printf("[Downloadgram] retry HTTP %d, %d bytes: %s\n", resp.StatusCode, len(body), bodyStr)
+			return "", nil
+		}
 	}
 
 	html := string(body)
@@ -708,52 +743,56 @@ func fetchDownloadgramImages(pageURL string) (title string, options []MediaOptio
 		title = t
 	}
 
-	seen := make(map[string]bool)
-	addURL := func(raw string) {
-		if raw == "" || !strings.Contains(raw, "http") {
-			return
-		}
-		// Dedup berdasarkan path CDN (tanpa query string) untuk menghindari duplikat URL CDN
-		dedupKey := normalizeURLForDedup(raw)
-		if seen[dedupKey] {
-			return
-		}
-		seen[dedupKey] = true
-		options = append(options, MediaOption{
-			Quality: fmt.Sprintf("Foto %d - Resolusi Penuh", len(options)+1),
-			Format:  detectExtFromURL(raw, "jpg"),
-			Size:    "Dinamis",
-			URL:     raw,
-		})
-	}
+	seenFilename := make(map[string]bool)
 
-	patterns := []string{
-		`https://cdn\.downloadgram\.org/\?token=[A-Za-z0-9._\-]+`,
-		`https://[^"'\s\\]+cdninstagram\.com[^"'\s\\]+`,
-		`https://[^"'\s\\]+scontent[^"'\s\\]+`,
-	}
-	// Kumpulkan semua URL kandidat dulu, baru dedup
-	var candidates []string
-	candidateSeen := make(map[string]bool)
-	for _, pattern := range patterns {
-		re := regexp.MustCompile(pattern)
-		for _, u := range re.FindAllString(html, -1) {
-			u = decodeHTMLEntities(strings.TrimSuffix(u, "\\"))
-			if u == "" || !strings.Contains(u, "http") || candidateSeen[u] {
+	// Decode JWT tokens from downloadgram to extract real CDN URLs
+	reToken := regexp.MustCompile(`https://cdn\.downloadgram\.org/\?token=([A-Za-z0-9._\-]+)`)
+	tokenURLs := reToken.FindAllStringSubmatch(html, -1)
+	log.Printf("[Downloadgram] Token URLs found: %d\n", len(tokenURLs))
+
+	for _, m := range tokenURLs {
+		if len(m) < 2 {
+			continue
+		}
+		fullURL := m[0]
+		filename, cdnURL := decodeDownloadgramToken(fullURL)
+		if cdnURL != "" {
+			dedupKey := "cdn:" + cdnURL
+			if seenFilename[dedupKey] {
+				log.Printf("[Downloadgram] Duplicate CDN URL\n")
 				continue
 			}
-			candidateSeen[u] = true
-			candidates = append(candidates, u)
+			seenFilename[dedupKey] = true
+			ext := detectExtFromURL(cdnURL, "jpg")
+			options = append(options, MediaOption{
+				Quality: fmt.Sprintf("Foto %d - Resolusi Penuh", len(options)+1),
+				Format:  ext,
+				Size:    "Dinamis",
+				URL:     cdnURL,
+			})
+			log.Printf("[Downloadgram] Using CDN URL from JWT: ext=%s, filename=%s\n", ext, filename)
+		} else {
+			// Fallback: use downloadgram proxy URL
+			key := normalizeURLForDedup(fullURL)
+			if seenFilename[key] {
+				continue
+			}
+			seenFilename[key] = true
+			options = append(options, MediaOption{
+				Quality: fmt.Sprintf("Foto %d - Resolusi Penuh", len(options)+1),
+				Format:  "jpg",
+				Size:    "Dinamis",
+				URL:     fullURL,
+			})
 		}
-	}
-	for _, u := range candidates {
-		addURL(u)
 	}
 
 	if title == "" && len(options) > 0 {
 		title = "Instagram Photo"
 	}
-	return title, filterImageOptions(options)
+	filtered := filterImageOptions(options)
+	log.Printf("[Downloadgram] After filter: %d options\n", len(filtered))
+	return title, filtered
 }
 
 func min(a, b int) int {

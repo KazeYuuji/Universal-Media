@@ -57,13 +57,28 @@ docker run -p 7860:7860 -e PORT=7860 media-backend
 
 ## Cookieless approach (current)
 - **Semua kode cookie dihapus** — tidak ada `--cookies`, `--cookies-from-browser`, atau `cookies.txt`
-- **Fallback chain (YouTube)**:
-  1. yt-dlp `-J` tanpa argumen cookie
-  2. kkdai library
-  3. thumbnail-only (judul + thumbnail saja, tanpa opsi download)
-- **YouTube sekarang blokir semua request tanpa auth** (perubahan YouTube Maret 2026). Ini mempengaruhi yt-dlp, pytubefix, kkdai, youtubei.js — semua library populer.
-- **Instagram, TikTok, Facebook** tidak terpengaruh — tetap berfungsi normal.
-- **Jika suatu saat yt-dlp atau YouTube berubah**, download akan kembali berfungsi otomatis tanpa perubahan kode.
+- **YouTube Fallback chain** (9 methods):
+  1. yt-dlp `-J` — coba 9 client config: `android`, `android_vr`, `web`, `ios`, `tv_android`, `web_creator`, `android+skip=webpage`, `android+no_dash`, `default`
+  2. kkdai library (10s timeout)
+  3. Invidious API (coba 8 instance: projectsegfau.lt, yewtu.be, nadeko.net, slipfox.xyz, puffyan.us, odyssey346.dev, privacydev.net, baczek.me)
+  4. Direct pipe `yt-dlp -f best[ext=mp4] -g` → dapat URL langsung
+  5. Simulation (real title via oEmbed, sample W3Schools video)
+- **YouTube dari IP rumahan**: BERHASIL — yt-dlp dengan `--js-runtimes node` + `--remote-components ejs:github` mendapat format hingga 4K 60fps, download via proxy valid MP4
+- **YouTube dari HF Spaces** (datacenter IP): GAGAL — Google blokir semua request tanpa cookies dari IP datacenter
+- **Instagram** (9 image extraction methods):
+  1. GraphQL API (`/graphql/query`)
+  2. Mobile API (`i.instagram.com/api/v1/media`)
+  3. Embed JSON (Facebook UA scrape `/embed/`)
+  4. Embed Scraping (Chrome UA scrape `/embed/captioned/`)
+  5. Public Viewer (Picuki, Imginn)
+  6. Downloadgram (`api.downloadgram.org/media`)
+  7. oEmbed (`api.instagram.com/oembed`)
+  8. Direct Page (scrape halaman IG langsung → og:image, JSON-LD, CDN regex)
+  9. Snapinsta Images (`snapinsta.app` → photo class, data-url, href)
+- **Instagram dari IP rumahan**: BERHASIL — downloadgram JWT token JPEG + CDN langsung via proxy (213KB, HTTP 200)
+- **Instagram dari HF Spaces**: GAGAL — CDN blokir IP datacenter (403)
+- **TikTok, Facebook** — tetap berfungsi normal (tidak terblokir)
+- **Jika suatu saat platform longgar**, download akan kembali berfungsi otomatis tanpa perubahan kode.
 
 ## Bug fixes done (cont.)
 - **Instagram video campur image**: downloadgram API return 2 token (image `.jpg` + video `.mp4`), keduanya dilabel "mp4". User download image → error "Cannot read image.png". Fix: `isDownloadgramVideoToken()` decode JWT payload, cek filename extension, skip token dengan `.jpg`
