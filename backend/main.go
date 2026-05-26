@@ -1106,13 +1106,18 @@ func runRealDownload(w http.ResponseWriter, flusher http.Flusher, pageURL, platf
 		return
 	}
 
-	// Try OG video fallback as secondary method (skip YouTube — never returns direct video URLs, only hangs)
 	if platform != "YouTube" && runOgVideoFallback(w, flusher, pageURL, platform) {
 		return
 	}
 
-	// Fallback to simulation if all scraping fails
-	runSimulation(w, flusher, pageURL, platform)
+	sendSSE(w, EventMessage{Status: "Menyelesaikan...", Progress: 95})
+	flusher.Flush()
+	time.Sleep(200 * time.Millisecond)
+	sendSSE(w, EventMessage{
+		Status: "Error",
+		Error:  fmt.Sprintf("Tidak dapat mengekstrak video dari %s. Pastikan link benar dan video dapat diakses publik.", platform),
+	})
+	flusher.Flush()
 }
 
 func runOgVideoFallback(w http.ResponseWriter, flusher http.Flusher, pageURL, platform string) bool {
@@ -1139,131 +1144,7 @@ func runOgVideoFallback(w http.ResponseWriter, flusher http.Flusher, pageURL, pl
 	return true
 }
 
-func runSimulation(w http.ResponseWriter, flusher http.Flusher, url string, platform string) {
-	var steps []struct {
-		status   string
-		progress int
-		delayMs  time.Duration
-	}
 
-	title := ""
-	duration := ""
-	thumbnail := ""
-	var options []MediaOption
-
-	// Working sample media URLs (accessible from HF Spaces)
-	sampleVideo := "https://www.w3schools.com/html/mov_bbb.mp4"
-	sampleAudio := "https://www.w3schools.com/html/horse.mp3"
-	sampleImage := "https://www.w3schools.com/w3images/fjords.jpg"
-
-	if platform == "Instagram" {
-		steps = []struct {
-			status   string
-			progress int
-			delayMs  time.Duration
-		}{
-			{"Menghubungkan ke Instagram GraphQL API...", 15, 600},
-			{"Menganalisa metadata Post/Reel/Story...", 40, 800},
-			{"Memverifikasi sesi penjelajahan Instagram...", 60, 600},
-			{"Mengekstrak tautan media CDN Instagram...", 85, 700},
-			{"Menyelesaikan opsi download...", 95, 400},
-		}
-		title = "Aesthetic Instagram Reel by @creative_mind"
-		duration = "0:30"
-		thumbnail = sampleImage
-		options = []MediaOption{
-			{Quality: "Video (Full HD 1080p)", Format: "mp4", Size: "15.4 MB", URL: sampleVideo},
-			{Quality: "Video (HD 720p)", Format: "mp4", Size: "8.2 MB", URL: sampleVideo},
-			{Quality: "Audio Only (MP3)", Format: "mp3", Size: "1.2 MB", URL: sampleAudio},
-			{Quality: "Cover Photo (JPG)", Format: "jpg", Size: "240 KB", URL: sampleImage},
-		}
-	} else if platform == "TikTok" {
-		steps = []struct {
-			status   string
-			progress int
-			delayMs  time.Duration
-		}{
-			{"Menghubungkan ke API Web TikTok...", 20, 500},
-			{"Mengekstrak video tanpa watermark (No-Watermark)...", 45, 900},
-			{"Mengunduh data audio & video terpisah...", 70, 700},
-			{"Membuka jalur direct link TikTok CDN...", 90, 600},
-			{"Menyelesaikan pengemasan...", 98, 300},
-		}
-		title = "Viral TikTok Dance Trends #trending #foryou"
-		duration = "0:15"
-		thumbnail = sampleImage
-		options = []MediaOption{
-			{Quality: "Video No Watermark (HD)", Format: "mp4", Size: "6.8 MB", URL: sampleVideo},
-			{Quality: "Video Watermarked (SD)", Format: "mp4", Size: "5.1 MB", URL: sampleVideo},
-			{Quality: "Audio Only (MP3)", Format: "mp3", Size: "620 KB", URL: sampleAudio},
-			{Quality: "Cover Photo (JPG)", Format: "jpg", Size: "180 KB", URL: sampleImage},
-		}
-	} else if platform == "Facebook" {
-		steps = []struct {
-			status   string
-			progress int
-			delayMs  time.Duration
-		}{
-			{"Membuka koneksi ke Facebook Graph API...", 15, 600},
-			{"Mengunduh manifes stream video HD dan SD...", 40, 800},
-			{"Bypass autentikasi publik Facebook CDN...", 70, 700},
-			{"Mengekstrak parameter tautan aman...", 90, 600},
-			{"Menyelesaikan pemrosesan...", 98, 300},
-		}
-		title = "Global News: Amazing Nature Discoveries and Scenic Beauty"
-		duration = "3:45"
-		thumbnail = sampleImage
-		options = []MediaOption{
-			{Quality: "Video HD (1080p)", Format: "mp4", Size: "45.2 MB", URL: sampleVideo},
-			{Quality: "Video SD (480p)", Format: "mp4", Size: "18.6 MB", URL: sampleVideo},
-			{Quality: "Audio Only (MP3)", Format: "mp3", Size: "3.5 MB", URL: sampleAudio},
-		}
-	} else {
-		platform = "YouTube"
-		steps = []struct {
-			status   string
-			progress int
-			delayMs  time.Duration
-		}{
-			{"Membuka koneksi ke YouTube Innertube API...", 15, 600},
-			{"Mengekstrak tanda tangan cipher & token player...", 40, 900},
-			{"Mengurai manifes format streaming (DASH/HLS)...", 65, 800},
-			{"Menggabungkan trek video 1080p dengan trek audio...", 85, 700},
-			{"Menyelesaikan penyusunan URL CDN Google Video...", 96, 400},
-		}
-		// Use real YouTube title & thumbnail via oEmbed API (no auth required)
-		if ytTitle, ytThumb := fetchYouTubeOEmbed(url); ytTitle != "" {
-			title = ytTitle
-			thumbnail = ytThumb
-		} else {
-			title = "YouTube Video"
-			thumbnail = sampleImage
-		}
-		duration = "12:45"
-		options = []MediaOption{
-			{Quality: "Video (Full HD 1080p)", Format: "mp4", Size: "78.4 MB", URL: sampleVideo},
-			{Quality: "Video (HD 720p)", Format: "mp4", Size: "32.1 MB", URL: sampleVideo},
-			{Quality: "Video (SD 360p)", Format: "mp4", Size: "12.8 MB", URL: sampleVideo},
-			{Quality: "Audio Only (MP3 320kbps)", Format: "mp3", Size: "11.7 MB", URL: sampleAudio},
-			{Quality: "Cover Photo (JPG)", Format: "jpg", Size: "350 KB", URL: sampleImage},
-		}
-	}
-
-	for _, step := range steps {
-		time.Sleep(step.delayMs * time.Millisecond)
-		sendSSE(w, EventMessage{
-			Status:   step.status,
-			Progress: step.progress,
-		})
-		flusher.Flush()
-	}
-
-	options = filterVideoOptions(options)
-	if len(options) == 0 {
-		return
-	}
-	completeSSE(w, flusher, "video", title, duration, thumbnail, options)
-}
 
 func setupSSE(w http.ResponseWriter) (http.Flusher, bool) {
 	w.Header().Set("Content-Type", "text/event-stream")

@@ -75,12 +75,14 @@ func initYtDlp() {
 			return
 		}
 	}
-	if p, err := exec.LookPath("python3"); err == nil && p != "" {
-		cmd := exec.Command(p, "-m", "yt_dlp", "--version")
-		if cmd.Run() == nil {
-			ytDlpBinary = p
-			ytDlpModuleArgs = []string{"-m", "yt_dlp"}
-			return
+	for _, py := range []string{"python3", "python"} {
+		if p, err := exec.LookPath(py); err == nil && p != "" {
+			cmd := exec.Command(p, "-m", "yt_dlp", "--version")
+			if cmd.Run() == nil {
+				ytDlpBinary = p
+				ytDlpModuleArgs = []string{"-m", "yt_dlp"}
+				return
+			}
 		}
 	}
 	ytDlpBinary = "yt-dlp"
@@ -126,6 +128,7 @@ type ytDlpFormat struct {
 	TBR            float64 `json:"tbr"`
 	Filesize       float64 `json:"filesize"`
 	FilesizeApprox float64 `json:"filesize_approx"`
+	Protocol       string  `json:"protocol"`
 }
 
 type ytDlpInfo struct {
@@ -175,23 +178,28 @@ func fetchYouTubeVideos(pageURL, platform string) (title string, duration string
 		return fetchYouTubeViaKkdai(pageURL, videoID)
 	}
 
-	// Try multiple yt-dlp client configs — try all known clients for maximum compatibility
+	// Try yt-dlp with various client configs — try all and pick the one with most options
+	type clientResult struct {
+		label   string
+		title   string
+		dur     string
+		thumb   string
+		options []MediaOption
+	}
+	var bestResult *clientResult
 	clientAttempts := []struct {
 		label string
 		args  []string
 	}{
+		{"default", nil},
+		{"web", []string{"--extractor-args", "youtube:player_client=web"}},
 		{"android", []string{"--extractor-args", "youtube:player_client=android"}},
 		{"android_vr", []string{"--extractor-args", "youtube:player_client=android_vr"}},
-		{"web", []string{"--extractor-args", "youtube:player_client=web"}},
 		{"ios", []string{"--extractor-args", "youtube:player_client=ios"}},
 		{"tv_android", []string{"--extractor-args", "youtube:player_client=tv_android"}},
 		{"web_creator", []string{"--extractor-args", "youtube:player_client=web_creator"}},
-		{"android_skip_webpage", []string{"--extractor-args", "youtube:player_client=android", "--extractor-args", "youtube:skip=webpage"}},
-		{"android_no_dash", []string{"--extractor-args", "youtube:player_client=android", "--extractor-args", "youtube:include_dash_manifest=False"}},
 		{"default+geo_bypass", []string{"--geo-bypass"}},
-		{"default+no_dash", []string{"--extractor-args", "youtube:include_dash_manifest=False"}},
-		{"default+skip_webpage", []string{"--extractor-args", "youtube:skip=webpage"}},
-		{"default", nil},
+		{"android_skip_webpage", []string{"--extractor-args", "youtube:player_client=android", "--extractor-args", "youtube:skip=webpage"}},
 	}
 	for _, attempt := range clientAttempts {
 		log.Printf("[YouTube] trying yt-dlp with %s client\n", attempt.label)
@@ -205,11 +213,22 @@ func fetchYouTubeVideos(pageURL, platform string) (title string, duration string
 		if !ok {
 			continue
 		}
-		title, duration, thumbnail, options = buildYouTubeOptionsFromInfo(info, videoID)
-		if len(options) > 0 {
-			log.Printf("[YouTube] yt-dlp %s client succeeded: %d options\n", attempt.label, len(options))
-			return title, duration, thumbnail, options
+		t, d, th, opts := buildYouTubeOptionsFromInfo(info, videoID)
+		if len(opts) == 0 {
+			continue
 		}
+		log.Printf("[YouTube] %s client: %d options\n", attempt.label, len(opts))
+		if bestResult == nil || len(opts) > len(bestResult.options) {
+			bestResult = &clientResult{label: attempt.label, title: t, dur: d, thumb: th, options: opts}
+		}
+		// If we have a good result with at least 3 options + audio, stop early
+		if len(opts) >= 4 {
+			break
+		}
+	}
+	if bestResult != nil {
+		log.Printf("[YouTube] using %s client result: %d options\n", bestResult.label, len(bestResult.options))
+		return bestResult.title, bestResult.dur, bestResult.thumb, bestResult.options
 	}
 
 	log.Printf("[YouTube] all yt-dlp clients failed, trying kkdai\n")
@@ -268,9 +287,15 @@ func buildYouTubeOptionsFromInfo(info ytDlpInfo, videoID string) (title string, 
 		if f.Ext != "mp4" {
 			continue
 		}
-		// Skip HLS VP formats (91-99) — yt-dlp reports them as mp4
-		// but they are actually MPEG-TS streams from HLS
-		if fid, _ := strconv.Atoi(f.FormatID); fid >= 91 && fid <= 99 {
+		// Skip HLS formats — yt-dlp reports them as mp4
+		// but they are actually MPEG-TS streams from HLS.
+		// HLS protocols: m3u8, m3u8_native, m3u8_fragmented
+		protocol := strings.ToLower(f.Protocol)
+		if strings.Contains(protocol, "m3u8") || strings.Contains(protocol, "hls") {
+			continue
+		}
+		// Also skip by format ID: 91-99 and 300-309 are known HLS ranges
+		if fid, _ := strconv.Atoi(f.FormatID); (fid >= 91 && fid <= 99) || (fid >= 300 && fid <= 399) {
 			continue
 		}
 		if seenHeight[f.Height] {
@@ -702,14 +727,34 @@ func fetchIGVideoViaDownloadgram(pageURL string) (title string, thumbnail string
 	req.Header.Set("Referer", "https://downloadgram.org/")
 
 	client := &http.Client{Timeout: 25 * time.Second}
-	resp, err := client.Do(req)
+
+	doRequest := func() (*http.Response, []byte, error) {
+		r, e := client.Do(req)
+		if e != nil {
+			return nil, nil, e
+		}
+		defer r.Body.Close()
+		b, e := io.ReadAll(r.Body)
+		return r, b, e
+	}
+
+	resp, body, err := doRequest()
 	if err != nil {
+		log.Printf("[Downloadgram Video] request error: %v\n", err)
 		return "", "", nil
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", "", nil
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("[Downloadgram Video] HTTP %d, %d bytes (will retry after 2s)\n", resp.StatusCode, len(body))
+		time.Sleep(2 * time.Second)
+		resp, body, err = doRequest()
+		if err != nil {
+			log.Printf("[Downloadgram Video] retry error: %v\n", err)
+			return "", "", nil
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			log.Printf("[Downloadgram Video] retry HTTP %d, %d bytes\n", resp.StatusCode, len(body))
+			return "", "", nil
+		}
 	}
 	html := string(body)
 	// downloadgram HTML is embedded in a JS string — convert escape sequences before parsing
